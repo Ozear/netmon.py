@@ -15,6 +15,7 @@ import csv
 import ctypes
 import hashlib
 import html as html_mod
+import json
 import logging
 import math
 import os
@@ -49,7 +50,7 @@ except ImportError:
     HAS_IPWHOIS = False
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 log = logging.getLogger("netmon")
 
@@ -326,6 +327,29 @@ class FlowAnalyzer:
     # when --save-capture is in effect.
     MAX_DETAIL_RECORDS = 10_000
 
+    # Per-packet preview capture: first N bytes of every TCP payload that
+    # contains data. Lets the HTML "Load Packets" feature show inline hex/
+    # ASCII for each flow without re-reading the .pcap. Capped to keep HTML
+    # size bounded (5000 * 200 bytes ~ 2 MB JSON worst case).
+    MAX_PACKET_PREVIEWS = 5_000
+    PACKET_PREVIEW_BYTES = 200
+
+    # Within this many seconds an identical (key) event is treated as the
+    # same logical packet (pktmon captures every packet at up to ~9 layers,
+    # all within the same microsecond). 0.1s is conservative — real retries
+    # in TCP/DNS land happen with backoff measured in hundreds of ms minimum.
+    DEDUP_WINDOW_SEC = 0.1
+
+    def _is_duplicate(self, dedup_map, key, ts):
+        """Return True if this event matches a recent identical one (same
+        key within DEDUP_WINDOW_SEC). Updates the map either way."""
+        last = dedup_map.get(key, -1e9)
+        if ts - last < self.DEDUP_WINDOW_SEC:
+            dedup_map[key] = ts
+            return True
+        dedup_map[key] = ts
+        return False
+
     def __init__(self):
         self.dns_queries = []                  # list of (qname, qtype, ts)
         self.dns_responses = defaultdict(set)  # qname -> {ip, ip, ...}
@@ -339,6 +363,17 @@ class FlowAnalyzer:
         self.dns_query_log = []      # list of dicts: {ts, qname, qtype, src, dst}
         self.tls_handshakes = []     # list of dicts: {ts, sni, src, dst}
         self.tcp_flow_log = {}       # 5-tuple -> {first_ts, last_ts, bytes, pkts}
+        self.http_messages = []      # list of dicts: {ts, kind, src, dst, method/status, host, path}
+        self.packet_previews = []    # list of dicts: {ts, src, dst, size, hex, ascii, proto}
+        # Multi-layer-capture dedup: pktmon captures every packet at multiple
+        # network-stack components (NDIS / WFP / TCP/IP / ALE), so a single
+        # logical packet shows up 6-9 times in the pcap with the same source
+        # port, destination, and content. We dedupe identical (key, ts-rounded)
+        # within a small window so the user-facing tables count real events.
+        self._dedup_dns = {}      # (src, dst, qname) -> last_seen_ts
+        self._dedup_tls = {}      # (src, dst, sni) -> last_seen_ts
+        self._dedup_http = {}     # (src, dst, kind, method_or_status, host, path) -> last_seen_ts
+        self._dedup_pkt = {}      # (src, dst, hex) -> last_seen_ts
 
     def feed_pcap(self, path, max_bytes=MAX_PCAP_BYTES):
         reader = PcapReader(path, max_bytes=max_bytes)
@@ -439,15 +474,63 @@ class FlowAnalyzer:
                 flow["last_ts"] = ts
                 flow["bytes"] += len(payload)
                 flow["pkts"] += 1
-            if dport == 443 and tcp_payload:
-                sni = self._extract_sni(tcp_payload)
-                if sni:
-                    self.sni_by_peer[dst_ip].add(sni)
-                    if len(self.tls_handshakes) < self.MAX_DETAIL_RECORDS:
-                        self.tls_handshakes.append({
-                            "ts": ts, "sni": sni,
-                            "src": f"{src_ip}:{sport}", "dst": f"{dst_ip}:{dport}",
-                        })
+            src_key = f"{src_ip}:{sport}"
+            dst_key = f"{dst_ip}:{dport}"
+
+            # Capture a bounded per-packet preview (hex + ASCII of the first
+            # PACKET_PREVIEW_BYTES of payload) so the HTML report can show
+            # inline packet detail when the user clicks "Load Packets" for
+            # a selected process. Dedup multi-layer captures by hex content.
+            if tcp_payload and len(self.packet_previews) < self.MAX_PACKET_PREVIEWS:
+                preview = tcp_payload[:self.PACKET_PREVIEW_BYTES]
+                hex_str = preview.hex()
+                pkt_key = (src_key, dst_key, hex_str)
+                if not self._is_duplicate(self._dedup_pkt, pkt_key, ts):
+                    ascii_repr = "".join(
+                        chr(b) if 32 <= b < 127 else "." for b in preview
+                    )
+                    if self._looks_like_tls_client_hello(tcp_payload):
+                        proto_guess = "TLS-CH"
+                    elif self._looks_like_http_request(tcp_payload):
+                        proto_guess = "HTTP-REQ"
+                    elif self._looks_like_http_response(tcp_payload):
+                        proto_guess = "HTTP-RSP"
+                    elif len(tcp_payload) >= 3 and tcp_payload[0] == 0x16 and tcp_payload[1] == 0x03:
+                        proto_guess = "TLS"
+                    elif tcp_payload.startswith(b"SSH-"):
+                        proto_guess = "SSH"
+                    else:
+                        proto_guess = "RAW"
+                    self.packet_previews.append({
+                        "ts": ts, "src": src_key, "dst": dst_key,
+                        "size": len(tcp_payload),
+                        "hex": hex_str, "ascii": ascii_repr,
+                        "proto": proto_guess,
+                    })
+
+            # Detect TLS / HTTP by their actual byte signatures rather than by
+            # port number — many services run TLS / HTTP on non-standard ports
+            # (Game-Pass on 6822, dev servers on 8000/3000/3001, etc.).
+            if tcp_payload:
+                if self._looks_like_tls_client_hello(tcp_payload):
+                    sni = self._extract_sni(tcp_payload)
+                    if sni:
+                        self.sni_by_peer[dst_ip].add(sni)
+                        tls_key = (src_key, dst_key, sni)
+                        if (not self._is_duplicate(self._dedup_tls, tls_key, ts)
+                                and len(self.tls_handshakes) < self.MAX_DETAIL_RECORDS):
+                            self.tls_handshakes.append({
+                                "ts": ts, "sni": sni,
+                                "src": src_key, "dst": dst_key,
+                            })
+                elif self._looks_like_http_request(tcp_payload):
+                    self._extract_http(ts, tcp_payload,
+                                       src_ip, sport, dst_ip, dport,
+                                       is_request=True)
+                elif self._looks_like_http_response(tcp_payload):
+                    self._extract_http(ts, tcp_payload,
+                                       src_ip, sport, dst_ip, dport,
+                                       is_request=False)
         elif proto == 17:  # UDP
             if len(payload) < 8:
                 return
@@ -459,14 +542,124 @@ class FlowAnalyzer:
             if dport == 53 and udp_payload:
                 qname, qtype = self._extract_dns_query(udp_payload)
                 if qname:
-                    self.dns_queries.append((qname, qtype, ts))
-                    if len(self.dns_query_log) < self.MAX_DETAIL_RECORDS:
-                        self.dns_query_log.append({
-                            "ts": ts, "qname": qname, "qtype": qtype,
-                            "src": f"{src_ip}:{sport}", "dst": f"{dst_ip}:{dport}",
-                        })
+                    src_key = f"{src_ip}:{sport}"
+                    dst_key = f"{dst_ip}:{dport}"
+                    dns_key = (src_key, dst_key, qname)
+                    if not self._is_duplicate(self._dedup_dns, dns_key, ts):
+                        self.dns_queries.append((qname, qtype, ts))
+                        if len(self.dns_query_log) < self.MAX_DETAIL_RECORDS:
+                            self.dns_query_log.append({
+                                "ts": ts, "qname": qname, "qtype": qtype,
+                                "src": src_key, "dst": dst_key,
+                            })
             elif sport == 53 and udp_payload:
                 self._extract_dns_response(udp_payload)
+
+    # HTTP parsing security: data is attacker-controlled. We refuse to
+    # accept oversized headers (1 KB) and reject embedded CR / LF / NUL
+    # in any extracted field so the parsed strings can't smuggle HTML.
+    _HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"OPTIONS ",
+                     b"PATCH ", b"CONNECT ", b"TRACE ")
+    _MAX_HTTP_HEADER_BYTES = 1024
+
+    @staticmethod
+    def _looks_like_tls_client_hello(data):
+        """Identify a TLS Client Hello by its on-the-wire signature.
+
+        TLS record header: type(1) + version(2) + length(2). For a Client Hello:
+          - type = 0x16 (Handshake)
+          - version major = 0x03 (SSL 3.0+ / all TLS versions)
+        Then the handshake header has type 0x01 (ClientHello).
+        Matching by byte signature lets us catch TLS on any port — not just 443.
+        """
+        return (len(data) >= 6
+                and data[0] == 0x16
+                and data[1] == 0x03
+                and data[5] == 0x01)
+
+    @classmethod
+    def _looks_like_http_request(cls, data):
+        """An HTTP request starts with a method token + space."""
+        if len(data) < 4:
+            return False
+        return any(data.startswith(m) for m in cls._HTTP_METHODS)
+
+    @staticmethod
+    def _looks_like_http_response(data):
+        """An HTTP response starts with 'HTTP/<major>.<minor> '."""
+        return (len(data) >= 8
+                and data.startswith(b"HTTP/")
+                and data[5:6].isdigit() and data[6:7] == b"."
+                and data[7:8].isdigit())
+
+    def _extract_http(self, ts, data, src_ip, sport, dst_ip, dport, is_request):
+        """Parse a plaintext HTTP request or response line from a TCP payload.
+
+        Only the first ~1 KB is inspected; long headers are truncated. Each
+        extracted field is sanitized (printable ASCII only). Never raises.
+        """
+        if not data or len(self.http_messages) >= self.MAX_DETAIL_RECORDS:
+            return
+        head = data[:self._MAX_HTTP_HEADER_BYTES]
+        # End of headers (CRLF CRLF) — beyond this we don't bother parsing.
+        end = head.find(b"\r\n\r\n")
+        if end != -1:
+            head = head[:end]
+        try:
+            text = head.decode("latin-1", errors="replace")
+        except UnicodeDecodeError:
+            return
+        lines = text.split("\r\n")
+        if not lines:
+            return
+        first = lines[0]
+
+        def _safe(s, n=200):
+            # Restrict to printable ASCII + space, cap length. Defends against
+            # CRLF / NUL / non-printable injection into the HTML report.
+            return "".join(c for c in s if 32 <= ord(c) < 127)[:n]
+
+        host = ""
+        for line in lines[1:8]:  # only check the first few headers
+            if line.lower().startswith("host:"):
+                host = _safe(line[5:].strip(), 120)
+                break
+
+        src_key = f"{src_ip}:{sport}"
+        dst_key = f"{dst_ip}:{dport}"
+        if is_request:
+            # Request line: "GET /path HTTP/1.1"
+            if not any(first.startswith(m.decode()) for m in self._HTTP_METHODS):
+                return
+            parts = first.split(" ", 2)
+            if len(parts) < 2:
+                return
+            method = _safe(parts[0], 12)
+            path = _safe(parts[1], 200)
+            key = (src_key, dst_key, "REQ", method, host, path)
+            if self._is_duplicate(self._dedup_http, key, ts):
+                return
+            self.http_messages.append({
+                "ts": ts, "kind": "REQ",
+                "src": src_key, "dst": dst_key,
+                "method": method, "path": path, "host": host, "status": "",
+            })
+        else:
+            # Response status line: "HTTP/1.1 200 OK"
+            if not first.startswith("HTTP/"):
+                return
+            parts = first.split(" ", 2)
+            if len(parts) < 2:
+                return
+            status = _safe(parts[1] + " " + (parts[2] if len(parts) > 2 else ""), 60)
+            key = (src_key, dst_key, "RSP", status, host, "")
+            if self._is_duplicate(self._dedup_http, key, ts):
+                return
+            self.http_messages.append({
+                "ts": ts, "kind": "RSP",
+                "src": src_key, "dst": dst_key,
+                "method": "", "path": "", "host": host, "status": status,
+            })
 
     def _extract_sni(self, data):
         """Extract SNI hostname from a TLS Client Hello payload.
@@ -980,7 +1173,7 @@ def listener_exposure_level(local_addr):
         ip = local_addr.split("]")[0][1:]
     else:
         ip = local_addr.rsplit(":", 1)[0]
-    if ip in ("0.0.0.0", "::", "[::]"):
+    if ip in ("0.0.0.0", "::", "[::]"):  # nosec B104 - exposure detection, not bind
         return "any"
     if ip.startswith("127.") or ip == "::1":
         return "loopback"
@@ -1015,7 +1208,7 @@ def describe_listener_exposure(local_addr):
         ip = local_addr.split("]")[0][1:]
     else:
         ip = local_addr.rsplit(":", 1)[0]
-    if ip in ("0.0.0.0",):
+    if ip in ("0.0.0.0",):  # nosec B104 - exposure description, not bind
         return "listening — exposed on ANY IPv4 interface"
     if ip in ("::", "[::]"):
         return "listening — exposed on ANY IPv6 interface"
@@ -1043,7 +1236,7 @@ def classify_local_ip(ip):
     """
     if not ip:
         return "no remote"
-    if ip in ("0.0.0.0", "::"):
+    if ip in ("0.0.0.0", "::"):  # nosec B104 - classification, not bind
         return "wildcard (any-interface listen)"
     if ip.startswith("127.") or ip == "::1":
         return "loopback (this host)"
@@ -1074,13 +1267,17 @@ def classify_local_ip(ip):
 
 
 class ThreatIntel:
-    def __init__(self, offline=False, console=None):
+    def __init__(self, offline=False, scan_tor=False, console=None):
         self.offline = offline
+        self.scan_tor = scan_tor
         self.console = console
         self.tor_exits = set()
         self._whois_cache = {}
         self._cache_dir = _safe_cache_dir()
-        if not offline:
+        # Tor exit-list fetch is now OPT-IN (--scan-tor). v1.1 made it default-on
+        # and many networks SNI-filter torproject.org, producing a noisy warning
+        # on every run. Users who want Tor-exit detection can pass --scan-tor.
+        if not offline and scan_tor:
             self._load_tor_exits()
 
     def _load_tor_exits(self):
@@ -1230,7 +1427,11 @@ class SecurityMonitor:
         self.file_hash_cache = {}
         self.headers = {"User-Agent": f"netmon.py/{VERSION}"}
         self.signing = SignatureChecker(enabled=not args.no_signing)
-        self.threat = ThreatIntel(offline=args.offline, console=console)
+        self.threat = ThreatIntel(
+            offline=args.offline,
+            scan_tor=getattr(args, "scan_tor", False),
+            console=console,
+        )
         self.vt = VirusTotalClient(args.vt_api_key, console=console) if args.vt_api_key else None
         self.flow = None
         self.capture = None
@@ -1423,10 +1624,25 @@ class SecurityMonitor:
                 score += 2
                 flags.append("UNSIGNED_USER_PATH")
 
-        # 6. Unsigned binary on a non-loopback connection
+        # 6. Unsigned binary with network activity. Score bumped from +1 to +2
+        # because an unsigned executable making outbound network calls is a
+        # primary C2 indicator. v1.1 under-weighted this and missed real C2.
         if conn["path"] and conn["path"] not in ("N/A", "Access Denied") and ip and not is_signed:
-            score += 1
+            score += 2
             flags.append("UNSIGNED_BINARY")
+
+        # 6b. UNSIGNED_OUTBOUND_C2: unsigned binary + ESTABLISHED connection +
+        # public destination IP. This is the textbook C2 fingerprint and
+        # should reach HIGH on its own. Combined with UNSIGNED_BINARY (+2)
+        # the score lands at HIGH (≥5) without requiring suspicious-path /
+        # suspicious-port / Tor-exit signals to also fire.
+        status = (conn.get("status") or "").upper()
+        if (conn["path"] and conn["path"] not in ("N/A", "Access Denied")
+                and ip and not is_signed
+                and status == "ESTABLISHED"
+                and classify_local_ip(ip) is None):
+            score += 3
+            flags.append("UNSIGNED_OUTBOUND_C2")
 
         # 7. VT malicious hits
         vt = conn.get("vt")
@@ -1971,6 +2187,46 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   input[type=search] { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font: inherit; min-width: 240px; }
   .filter-btn { background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit; }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .control-group-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
+  .status-btn { font-size: 11px; padding: 3px 8px; }
+  /* Process selection: the process name cell is a button-styled clickable
+     element so the affordance is unambiguous. Whole-row click also works
+     as a fallback for clicks anywhere outside the VT hash link. */
+  #conntable tbody tr { cursor: pointer; }
+  #conntable tbody tr:hover { outline: 1px solid rgba(88, 166, 255, 0.3); }
+  .proc-link {
+    color: var(--accent); cursor: pointer; user-select: none;
+    text-decoration: underline dotted; text-underline-offset: 3px;
+    text-decoration-color: rgba(88, 166, 255, 0.4);
+  }
+  .proc-link:hover {
+    color: #fff; text-decoration: underline solid;
+    text-decoration-color: var(--accent);
+  }
+  tr.selected-process {
+    background: rgba(88, 166, 255, 0.15) !important;
+    box-shadow: inset 4px 0 0 var(--accent), inset -4px 0 0 var(--accent);
+  }
+  tr.selected-process td { color: var(--text) !important; }
+  /* Brief flash animation on row click so the user always gets visual
+     feedback even if the selection state didn't change. */
+  @keyframes row-flash {
+    0%   { background: rgba(88, 166, 255, 0.40); }
+    100% { background: transparent; }
+  }
+  tr.click-flash { animation: row-flash 0.4s ease-out; }
+  #process-selection-indicator {
+    display: none; padding: 8px 12px; margin-bottom: 12px;
+    background: rgba(88, 166, 255, 0.10); border: 1px solid var(--accent);
+    border-radius: 6px; color: var(--text); font-size: 12px;
+  }
+  #process-selection-indicator.visible { display: block; }
+  #process-selection-indicator .name { color: var(--accent); font-weight: 600; }
+  #process-selection-indicator button {
+    margin-left: 12px; background: var(--panel); border: 1px solid var(--border);
+    color: var(--text); padding: 2px 10px; border-radius: 4px; cursor: pointer;
+    font: inherit; font-size: 11px;
+  }
   label.toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; color: var(--muted); }
   label.toggle:hover { color: var(--text); }
   label.toggle input { accent-color: var(--accent); }
@@ -2005,6 +2261,15 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   .kv .k { color: var(--muted); }
   td.path { font-size: 11px; color: var(--muted); word-break: break-all; max-width: 320px; }
   td.local { font-size: 11px; color: var(--accent); white-space: nowrap; }
+  #load-packets-btn:not(:disabled) { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #packet-detail { margin-top: 12px; }
+  .packet { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin-bottom: 6px; font-size: 11px; }
+  .packet-head { color: var(--muted); margin-bottom: 4px; }
+  .packet-head .proto { display: inline-block; padding: 1px 6px; border-radius: 3px; background: var(--panel); color: var(--accent); margin-right: 8px; font-weight: 600; }
+  .packet-head .direction { color: var(--orange); margin: 0 6px; }
+  .packet-hex { font-family: ui-monospace, "SF Mono", Consolas, monospace; white-space: pre; line-height: 1.4; overflow-x: auto; }
+  .packet-hex .hex-byte { color: var(--text); }
+  .packet-hex .ascii { color: var(--green); }
   /* Listener-exposure highlighting — make exposed listeners shine */
   /* Remote cell is the 6th td: Risk, Process, PID, Signed, Local, Remote, ... */
   tr.cat-exposed-any   td:nth-child(6) {
@@ -2047,12 +2312,31 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
 
 <div class="controls">
   <input type="search" id="filter" placeholder="Search process, IP, hostname, flag, hash...">
-  <button class="filter-btn active" data-risk="all">All</button>
+  <span class="control-group-label">Risk:</span>
+  <button class="filter-btn" data-risk="all">All</button>
   <button class="filter-btn" data-risk="HIGH">High</button>
   <button class="filter-btn" data-risk="MED">Medium</button>
   <button class="filter-btn" data-risk="LOW">Low</button>
   $noise_toggle
-  <span class="muted">Click any SHA256 to query VirusTotal &rarr;</span>
+</div>
+<div class="controls">
+  <span class="control-group-label">Status:</span>
+  <button class="filter-btn status-btn" data-status="all">All</button>
+  <button class="filter-btn status-btn active" data-status="status-established">Established</button>
+  <button class="filter-btn status-btn" data-status="status-listen">Listening</button>
+  <button class="filter-btn status-btn" data-status="status-time-wait">Time-Wait</button>
+  <button class="filter-btn status-btn" data-status="status-close-wait">Close-Wait</button>
+  <button class="filter-btn status-btn" data-status="status-syn-sent">Syn-Sent</button>
+  <button class="filter-btn status-btn" data-status="status-syn-recv">Syn-Recv</button>
+  <button class="filter-btn status-btn" data-status="status-fin-wait">Fin-Wait</button>
+  <button class="filter-btn status-btn" data-status="status-other">Other</button>
+  <span class="muted">Click a process row to drill into its pcap traffic. SHA-256 links open VirusTotal.</span>
+</div>
+
+<div id="process-selection-indicator">
+  Drill-down active: <span class="name" id="selected-process-name">—</span>
+  <span id="selection-counts" class="muted"></span>
+  <button id="clear-selection">Clear</button>
 </div>
 
 <table id="conntable">
@@ -2106,44 +2390,57 @@ $packet_log_section
   const tbody = document.querySelector('#conntable tbody');
   const rows = Array.from(tbody.rows);
   const filter = document.getElementById('filter');
-  const buttons = document.querySelectorAll('.filter-btn');
+  const riskButtons = document.querySelectorAll('.filter-btn:not(.status-btn)');
+  const statusButtons = document.querySelectorAll('.filter-btn.status-btn');
   const noiseToggle = document.getElementById('show-noisy');
   const statTiles = document.querySelectorAll('.stat[data-filter]');
+  const pcapTables = document.querySelectorAll('.log-table tbody');
 
-  // Filter state: a single risk filter (HIGH/MED/LOW/all) and a set of
-  // category filters (cat-unsigned / cat-tor / cat-vt-malicious / cat-external).
-  // Risk buttons OR risk-tagged stat tiles set activeRisk; non-risk stat
-  // tiles toggle into activeCategories. A row is shown iff it matches the
-  // text query AND the risk filter AND every active category (AND'd).
+  // Filter state:
+  //   activeRisk    — risk dimension: 'all' / 'HIGH' / 'MED' / 'LOW'
+  //   activeStatus  — connection-state dimension: 'all' / 'status-established' / …
+  //                   Default is 'status-established' (most useful triage view —
+  //                   passive Listen/TIME_WAIT noise hidden).
+  //   activeCategories — set of cat-* filters (unsigned, tor, exposed, …).
+  //   selectedProcess  — process name selected via row click; drills the pcap
+  //                      detail tables down to that process's local ports.
   let activeRisk = 'all';
+  let activeStatus = 'status-established';
   const activeCategories = new Set();
+  let selectedProcess = null;
+  let selectedProcessPorts = new Set();
 
   function isRiskFilter(key) {
     return key === 'HIGH' || key === 'MED' || key === 'LOW';
   }
 
+  // When user clicks risk / category, reset status to 'all'. Otherwise
+  // clicking "HIGH" while status=Established could hide a HIGH-risk LISTEN
+  // (e.g. unsigned binary on :4444). Make sure intentional searches always
+  // see all matching rows regardless of the default Established-only view.
+  function resetStatusToAll() { activeStatus = 'all'; }
+
   function applyFilters() {
     const q = filter.value.toLowerCase();
     const dedupeProcess = activeCategories.has('dedupe-process');
-    // When any explicit filter is active, auto-reveal noisy (Microsoft +
-    // System) rows so the matching count actually matches what's visible.
-    // Otherwise rows tagged 'noisy' would be hidden by CSS even when the
-    // filter targets them (e.g. Exposed: LAN often contains noisy services).
-    const explicit = (activeRisk !== 'all') || activeCategories.size > 0 || q !== '';
+    // Auto-reveal noisy rows whenever any explicit filter is active so the
+    // visible count matches the stat tile.
+    const explicit = (activeRisk !== 'all') || activeCategories.size > 0
+                     || q !== '' || activeStatus !== 'all';
     body.classList.toggle('show-noisy', explicit || (noiseToggle && noiseToggle.checked));
 
     const seenProc = new Set();
     rows.forEach(r => {
       const matchesText = !q || r.textContent.toLowerCase().includes(q);
       const matchesRisk = activeRisk === 'all' || r.classList.contains(activeRisk);
+      const matchesStatus = activeStatus === 'all' || r.classList.contains(activeStatus);
       let matchesCats = true;
       activeCategories.forEach(cat => {
-        if (cat === 'dedupe-process') return;  // handled below
+        if (cat === 'dedupe-process') return;
         if (!r.classList.contains(cat)) matchesCats = false;
       });
-      let visible = matchesText && matchesRisk && matchesCats;
+      let visible = matchesText && matchesRisk && matchesStatus && matchesCats;
       if (visible && dedupeProcess) {
-        // 2nd column is Process; keep only the first row per process name.
         const proc = (r.cells[1].textContent || '').trim();
         if (seenProc.has(proc)) visible = false;
         else seenProc.add(proc);
@@ -2151,8 +2448,8 @@ $packet_log_section
       r.style.display = visible ? '' : 'none';
     });
 
-    // Sync visual state on risk buttons + stat tiles.
-    buttons.forEach(b => b.classList.toggle('active', b.dataset.risk === activeRisk));
+    riskButtons.forEach(b => b.classList.toggle('active', b.dataset.risk === activeRisk));
+    statusButtons.forEach(b => b.classList.toggle('active', b.dataset.status === activeStatus));
     statTiles.forEach(t => {
       const f = t.dataset.filter;
       t.classList.toggle('active',
@@ -2160,29 +2457,168 @@ $packet_log_section
         (!isRiskFilter(f) && activeCategories.has(f))
       );
     });
+
+    applyPcapFilter();
+  }
+
+  function applyPcapFilter() {
+    // Per-process drill-down: when a row is selected, filter pcap detail
+    // tables (DNS, TLS, TCP flows) to show only rows whose source/destination
+    // address contains one of the selected process's local ports.
+    pcapTables.forEach(tb => {
+      Array.from(tb.rows).forEach(r => {
+        if (!selectedProcess) { r.style.display = ''; return; }
+        const txt = r.textContent;
+        let match = false;
+        for (const p of selectedProcessPorts) {
+          if (txt.indexOf(':' + p) !== -1) { match = true; break; }
+        }
+        r.style.display = match ? '' : 'none';
+      });
+    });
   }
 
   filter.addEventListener('input', applyFilters);
 
-  buttons.forEach(b => b.addEventListener('click', () => {
+  riskButtons.forEach(b => b.addEventListener('click', () => {
     activeRisk = b.dataset.risk;
     if (activeRisk === 'all') activeCategories.clear();
+    resetStatusToAll();
+    applyFilters();
+  }));
+
+  statusButtons.forEach(b => b.addEventListener('click', () => {
+    activeStatus = b.dataset.status;
     applyFilters();
   }));
 
   statTiles.forEach(tile => tile.addEventListener('click', () => {
     const key = tile.dataset.filter;
     if (isRiskFilter(key)) {
-      // Click on a risk-stat tile = same as clicking the risk button.
       activeRisk = (activeRisk === key) ? 'all' : key;
     } else {
-      // Toggle category filter on/off (allows stacking, e.g. "HIGH + unsigned").
       if (activeCategories.has(key)) activeCategories.delete(key);
       else activeCategories.add(key);
     }
+    resetStatusToAll();
     applyFilters();
   }));
 
+  // Per-process drill-down. Click any row to select that process's local
+  // ports; click again to deselect. The selection indicator at the top of
+  // the table shows what's selected + how much pcap data exists for it.
+  const selectionIndicator = document.getElementById('process-selection-indicator');
+  const selectionName = document.getElementById('selected-process-name');
+  const selectionCounts = document.getElementById('selection-counts');
+  const clearSelectionBtn = document.getElementById('clear-selection');
+
+  function deselectProcess() {
+    selectedProcess = null;
+    selectedProcessPorts = new Set();
+    rows.forEach(rr => rr.classList.remove('selected-process'));
+    if (selectionIndicator) selectionIndicator.classList.remove('visible');
+    applyFilters();
+  }
+
+  function selectProcess(proc) {
+    selectedProcess = proc;
+    selectedProcessPorts = new Set();
+    rows.forEach(rr => {
+      const proc2 = (rr.cells[1].textContent || '').trim();
+      if (proc2 === proc) {
+        const local = (rr.cells[4].textContent || '').trim();
+        const colon = local.lastIndexOf(':');
+        if (colon >= 0) {
+          const port = local.slice(colon + 1).replace(/[^0-9]/g, '');
+          if (port) selectedProcessPorts.add(port);
+        }
+      }
+      rr.classList.toggle('selected-process', proc2 === proc);
+    });
+
+    // Count data available for this process across all pcap tables.
+    let dnsMatches = 0, tlsMatches = 0, httpMatches = 0, tcpMatches = 0;
+    pcapTables.forEach((tb, idx) => {
+      Array.from(tb.rows).forEach(r => {
+        const txt = r.textContent;
+        for (const p of selectedProcessPorts) {
+          if (txt.indexOf(':' + p) !== -1) {
+            // Heuristic: the first three .log-table tbodys are DNS, TLS, HTTP
+            // in render order, then TCP flows. We just give a total count.
+            if (idx === 0) dnsMatches++;
+            else if (idx === 1) tlsMatches++;
+            else if (idx === 2) httpMatches++;
+            else tcpMatches++;
+            break;
+          }
+        }
+      });
+    });
+    const pktMatches = (typeof previewsForSelectedProcess === 'function')
+                       ? previewsForSelectedProcess().length : 0;
+    const totalDetail = dnsMatches + tlsMatches + httpMatches + tcpMatches + pktMatches;
+
+    if (selectionIndicator) {
+      selectionName.textContent = proc;
+      selectionCounts.textContent =
+        ' · ' + dnsMatches + ' DNS, ' + tlsMatches + ' TLS, '
+        + httpMatches + ' HTTP, ' + tcpMatches + ' TCP flows, '
+        + pktMatches + ' captured packets';
+      selectionIndicator.classList.add('visible');
+    }
+
+    applyFilters();
+    // Auto-scroll to packet log ONLY when there's data to show. If pcap
+    // detail is empty for this process, the user stays in the connection
+    // table where the selection highlight is now visible.
+    if (totalDetail > 0) {
+      const target = document.querySelector('.log-table');
+      if (target) {
+        let p = target.parentElement;
+        while (p && p.tagName !== 'BODY') {
+          if (p.tagName === 'DETAILS') p.open = true;
+          p = p.parentElement;
+        }
+        target.scrollIntoView({behavior: 'smooth', block: 'start'});
+      }
+    }
+  }
+
+  function handleRowClick(r, evt) {
+    // Let SHA-256 VT links work — we explicitly skip those.
+    if (evt && evt.target && evt.target.tagName === 'A') return;
+    const proc = (r.cells[1].textContent || '').trim();
+    if (!proc) return;
+    // Flash the row briefly so the user always sees that the click registered,
+    // even if (de)selection state is the same.
+    r.classList.remove('click-flash');
+    void r.offsetWidth;  // force reflow so the animation restarts
+    r.classList.add('click-flash');
+    if (selectedProcess === proc) deselectProcess();
+    else selectProcess(proc);
+  }
+
+  rows.forEach(r => {
+    // Whole-row click as fallback
+    r.addEventListener('click', evt => handleRowClick(r, evt));
+    // Specific clickable element on the process-name cell so the
+    // affordance is unambiguous (the underline + accent color screams
+    // "I am clickable").
+    const procCell = r.cells[1];
+    if (procCell) {
+      const link = procCell.querySelector('.proc-link');
+      if (link) {
+        link.addEventListener('click', evt => {
+          evt.stopPropagation();   // don't double-fire via row handler
+          handleRowClick(r, evt);
+        });
+      }
+    }
+  });
+
+  if (clearSelectionBtn) {
+    clearSelectionBtn.addEventListener('click', deselectProcess);
+  }
 
   if (noiseToggle) {
     noiseToggle.addEventListener('change', () => {
@@ -2204,6 +2640,139 @@ $packet_log_section
       sorted.forEach(r => tbody.appendChild(r));
     });
   });
+
+  // === "Load Packets" — read embedded packet previews and render inline ===
+  const loadBtn = document.getElementById('load-packets-btn');
+  const loadCount = document.getElementById('load-packets-count');
+  const packetDetail = document.getElementById('packet-detail');
+  const previewBlob = document.getElementById('packet-previews');
+  let allPreviews = [];
+  if (previewBlob && previewBlob.textContent.trim()) {
+    try { allPreviews = JSON.parse(previewBlob.textContent); } catch (e) { allPreviews = []; }
+  }
+
+  function previewsForSelectedProcess() {
+    if (!selectedProcess || selectedProcessPorts.size === 0) return [];
+    const ports = new Set();
+    selectedProcessPorts.forEach(p => ports.add(':' + p));
+    return allPreviews.filter(p => {
+      for (const port of ports) {
+        if (p.src.endsWith(port) || p.dst.endsWith(port)) return true;
+      }
+      return false;
+    });
+  }
+
+  function refreshLoadButton() {
+    if (!loadBtn) return;
+    // Clear any previously-rendered packet detail when the selection changes.
+    // Otherwise stale packets from a previous selection persist below the button.
+    if (packetDetail) packetDetail.innerHTML = '';
+    const matching = previewsForSelectedProcess();
+    if (!selectedProcess) {
+      loadBtn.disabled = true;
+      loadBtn.textContent = 'Load packets';
+      if (loadCount) loadCount.textContent = '';
+    } else if (matching.length === 0) {
+      loadBtn.disabled = true;
+      loadBtn.textContent = 'Load packets';
+      if (loadCount) loadCount.textContent =
+        ' — no captured payload packets for ' + selectedProcess
+        + ' (pure ACKs and metadata-only packets are not stored)';
+    } else {
+      loadBtn.disabled = false;
+      loadBtn.textContent = 'Load ' + matching.length + ' packets for ' + selectedProcess;
+      if (loadCount) loadCount.textContent = '';
+    }
+  }
+
+  function fmtTs(ts) {
+    if (!ts) return '-';
+    const d = new Date(ts * 1000);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return hh + ':' + mm + ':' + ss + '.' + ms;
+  }
+
+  function renderHexAscii(hex, ascii) {
+    // Format like xxd: 16 bytes per line, with the ASCII gutter.
+    const out = [];
+    for (let i = 0; i < hex.length; i += 32) {
+      const hexChunk = hex.slice(i, i + 32);
+      const asciiStart = i / 2;
+      const asciiChunk = ascii.slice(asciiStart, asciiStart + 16);
+      // Group hex into pairs for readability
+      const grouped = [];
+      for (let j = 0; j < hexChunk.length; j += 2) {
+        grouped.push(hexChunk.slice(j, j + 2));
+      }
+      const offset = ('0000' + asciiStart.toString(16)).slice(-4);
+      out.push(offset + '  ' + grouped.join(' ').padEnd(48) + '  ' + asciiChunk);
+    }
+    return out.join('\\n');
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+
+  function renderPackets() {
+    if (!packetDetail) return;
+    const matching = previewsForSelectedProcess();
+    if (matching.length === 0) {
+      packetDetail.innerHTML = '';
+      return;
+    }
+    const parts = [];
+    parts.push('<p class="muted">Showing ' + matching.length + ' packet'
+               + (matching.length === 1 ? '' : 's') + ' for '
+               + escapeHtml(selectedProcess) + ' (first '
+               + (allPreviews.length && allPreviews[0].hex ? (allPreviews[0].hex.length / 2) : 0)
+               + ' bytes of each payload; pure ACKs not stored).</p>');
+    for (const p of matching) {
+      const local = selectedProcessPorts;
+      // Figure out direction by which side matches a local port.
+      let direction = '→';
+      for (const port of local) {
+        if (p.src.endsWith(':' + port)) direction = '→ OUT';
+        else if (p.dst.endsWith(':' + port)) direction = '← IN';
+      }
+      parts.push(
+        '<div class="packet">' +
+          '<div class="packet-head">' +
+            '<span class="proto">' + escapeHtml(p.proto) + '</span>' +
+            fmtTs(p.ts) +
+            '<span class="direction">' + escapeHtml(direction) + '</span>' +
+            escapeHtml(p.src) + '  →  ' + escapeHtml(p.dst) +
+            '  ' + p.size + ' bytes' +
+          '</div>' +
+          '<pre class="packet-hex">' + escapeHtml(renderHexAscii(p.hex, p.ascii)) + '</pre>' +
+        '</div>'
+      );
+    }
+    packetDetail.innerHTML = parts.join('');
+  }
+
+  if (loadBtn) {
+    loadBtn.addEventListener('click', renderPackets);
+    refreshLoadButton();
+  }
+
+  // Hook into the existing process-click flow: refresh the button label
+  // whenever the selection changes. The selection logic above already
+  // updates selectedProcess + selectedProcessPorts before calling
+  // applyFilters(), and applyFilters() calls applyPcapFilter() — we tack
+  // refreshLoadButton on the end of that chain.
+  const origApplyPcap = applyPcapFilter;
+  applyPcapFilter = function() { origApplyPcap(); refreshLoadButton(); };
+
+  // Apply initial filter — Status defaults to Established for the most useful
+  // triage view; "All" or any other status button opens it up.
+  applyFilters();
 })();
 </script>
 </body>
@@ -2356,12 +2925,31 @@ def render_html(conn_history, args, flow, output_path, console,
             elif level == "lan":
                 row_class_set.append("cat-exposed-lan")
             # loopback listeners aren't highlighted (safe)
+
+        # Status filter: tag every row with a status-* class so the new status
+        # button row can filter by connection state (ESTABLISHED, LISTEN, etc.).
+        # Normalize to lowercase ASCII and group rarely-seen states under 'other'.
+        _STATUS_GROUPS = {
+            "ESTABLISHED": "status-established",
+            "LISTEN": "status-listen",
+            "TIME_WAIT": "status-time-wait",
+            "CLOSE_WAIT": "status-close-wait",
+            "SYN_SENT": "status-syn-sent",
+            "SYN_RECV": "status-syn-recv",
+            "FIN_WAIT1": "status-fin-wait",
+            "FIN_WAIT2": "status-fin-wait",
+            "LAST_ACK": "status-fin-wait",
+            "CLOSING": "status-fin-wait",
+            "NONE": "status-listen",   # UDP listeners report NONE; group with LISTEN
+        }
+        status_raw = (c.get("status") or "NONE").upper()
+        row_class_set.append(_STATUS_GROUPS.get(status_raw, "status-other"))
         row_classes = " ".join(row_class_set)
 
         rows_html.append(
             f'<tr class="{row_classes}">'
             f'<td><span class="risk {c["risk"]}">{c["risk"]}</span></td>'
-            f'<td>{html_mod.escape(c["app"] or "")}</td>'
+            f'<td><span class="proc-link">{html_mod.escape(c["app"] or "")}</span></td>'
             f'<td>{c["pid"] or ""}</td>'
             f'<td class="sig {sig_class}">{html_mod.escape(sig_text)}</td>'
             f'<td class="local">{local_html}</td>'
@@ -2474,10 +3062,46 @@ def render_html(conn_history, args, flow, output_path, console,
             for (src_ip, sport, dst_ip, dport, _), f in sorted_flows
         ) or "<tr><td colspan='5' class='muted'>(no TCP flows logged)</td></tr>"
 
+        # HTTP request/response log (plaintext only — port 80)
+        http_log_rows = "".join(
+            f'<tr><td>{html_mod.escape(datetime.fromtimestamp(m["ts"]).strftime("%H:%M:%S.%f")[:-3] if m["ts"] else "-")}</td>'
+            f'<td>{html_mod.escape(m["kind"])}</td>'
+            f'<td>{html_mod.escape(m["method"] or m["status"])}</td>'
+            f'<td>{html_mod.escape(m["host"])}</td>'
+            f'<td>{html_mod.escape(m["path"])}</td>'
+            f'<td>{html_mod.escape(m["src"])}</td>'
+            f'<td>{html_mod.escape(m["dst"])}</td>'
+            f'</tr>'
+            for m in flow.http_messages[:500]
+        ) or "<tr><td colspan='7' class='muted'>(no plaintext HTTP — modern traffic is HTTPS so this is normal)</td></tr>"
+
+        # Serialize packet previews as JSON for the on-demand "Load packets"
+        # button. Using json.dumps protects against accidental HTML/script
+        # injection — every string is properly escaped and quoted. We embed
+        # inside <script type="application/json"> so the browser never
+        # executes it as code, just treats it as a data island.
+        previews_payload = [
+            {
+                "ts": p["ts"],
+                "src": p["src"],
+                "dst": p["dst"],
+                "size": p["size"],
+                "hex": p["hex"],
+                "ascii": p["ascii"],
+                "proto": p["proto"],
+            }
+            for p in flow.packet_previews
+        ]
+        # </script> in the JSON would terminate the data island; replace the
+        # literal "</" sequence with the equivalent escaped form so it's
+        # impossible to break out of the script tag.
+        packet_previews_json = json.dumps(previews_payload).replace("</", "<\\/")
+
         packet_log_section = f"""
 <details>
 <summary>Saved packet capture &mdash; browsable detail (HTTPS payloads encrypted; metadata only)</summary>
 {pcap_link}
+<p class="muted" style="margin-top:8px">Tip: click any row in the connection table above to drill these tables down to that process's local ports. Click the same row again to clear.</p>
 <h3 style="margin-top:16px">DNS queries (full log, up to 500 rows)</h3>
 <table class="log-table">
   <thead><tr><th>Time</th><th>Name</th><th>Type</th><th>Source</th><th>Destination</th></tr></thead>
@@ -2488,11 +3112,24 @@ def render_html(conn_history, args, flow, output_path, console,
   <thead><tr><th>Time</th><th>SNI hostname</th><th>Source</th><th>Destination</th></tr></thead>
   <tbody>{tls_log_rows}</tbody>
 </table>
+<h3 style="margin-top:16px">HTTP request / response (plaintext port-80 only, up to 500 rows)</h3>
+<table class="log-table">
+  <thead><tr><th>Time</th><th>Type</th><th>Method / Status</th><th>Host</th><th>Path</th><th>Source</th><th>Destination</th></tr></thead>
+  <tbody>{http_log_rows}</tbody>
+</table>
 <h3 style="margin-top:16px">TCP flows (top 100 by bytes)</h3>
 <table class="log-table">
   <thead><tr><th>Source</th><th>Destination</th><th>Bytes</th><th>Packets</th><th>Duration</th></tr></thead>
   <tbody>{tcp_log_rows}</tbody>
 </table>
+<h3 style="margin-top:16px">Packet contents</h3>
+<div id="packet-load-area">
+  <p class="muted">Select a process row above to enable per-packet inspection.</p>
+  <button id="load-packets-btn" class="filter-btn" disabled>Load packets</button>
+  <span id="load-packets-count" class="muted"></span>
+  <div id="packet-detail"></div>
+</div>
+<script type="application/json" id="packet-previews">{packet_previews_json}</script>
 </details>
 """
 
@@ -2597,6 +3234,11 @@ def _build_arg_parser():
                              "the key in process listings (ps, Task Manager) and shell history.")
     parser.add_argument("--offline", action="store_true",
                         help="Skip GeoIP / threat-intel network calls")
+    parser.add_argument("--scan-tor", action="store_true",
+                        help="Fetch and use the Tor exit-list to flag connections to Tor exits. "
+                             "Default OFF — many networks SNI-filter torproject.org and this "
+                             "produces a noisy warning otherwise. Enable when you actually want "
+                             "Tor-exit detection.")
     parser.add_argument("--no-signing", action="store_true",
                         help="Skip Authenticode signature verification")
     parser.add_argument("-v", "--verbose", action="count", default=0,
