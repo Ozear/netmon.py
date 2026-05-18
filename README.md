@@ -101,7 +101,14 @@ sudo ./.venv/bin/python netmon.py -t 30 --html report.html
 ## 🚀 Usage
 
 ```bash
-# Quick triage (15-second monitor + HTML dashboard)
+# 🎯 Easiest — full triage in ONE flag (recommended first run)
+# Equivalent to: -t 30 --capture --persistence --hash-tasks --scan-webroots --logs 3
+python netmon.py --tr
+
+# Same, but stretch the capture / log window:
+python netmon.py --tr -t 60 --logs 10
+
+# Quick monitor (15-second snapshot + HTML dashboard, no capture / no logs)
 python netmon.py -t 30 --html report.html
 
 # Full power (admin/root): packet capture + VT enrichment + verbose logging
@@ -111,25 +118,39 @@ python netmon.py -t 60 --capture --html report.html -vv
 python netmon.py --offline --html report.html
 ```
 
+> **Tip:** `--tr` is the shortest possible way to get a complete report. It implies six other flags but **any explicit flag you also pass wins** — so `--tr -t 60 --logs 30 --vt-api-key $VT_API_KEY` is the "everything on" power-user command.
+
 ### Command-line options
 
 | Flag | Default | What it does |
 |---|---|---|
-| `-t`, `--time` | `15` | Monitoring duration in seconds (1 – 86400) |
+| **`--full-triage`** / **`--tr`** | *(off)* | **🎯 One-flag complete triage.** Activates `-t 30`, `--capture`, `--yes`, `--persistence`, `--hash-tasks`, `--scan-webroots`, `--logs 3`. Any explicit flag you also pass wins (e.g. `--tr -t 60` runs for 60s). Does NOT auto-enable Tor scanning or JSON output — pass `--scan-tor` / `--json` explicitly if needed. Recommended starting point for any host triage. |
+| `-t`, `--time` | `15` | Monitoring duration in seconds (1 – 86400). |
 | `--html [PATH]` | **on** | Self-contained HTML report. ON by default — writes `./reports/netmon-<TS>.html` (timestamped, never overwrites prior runs). Pass an explicit path to override or `--no-html` to disable. |
 | `--text [PATH]` | **on** | Plain-text report (cat / grep / less friendly fixed-width columns). ON by default — writes `./reports/netmon-<TS>.txt`. Disable with `--no-text`. |
 | `-o`, `--output`, `--csv [PATH]` | *(off)* | CSV machine-readable export. **Opt-in**. Pass `--csv` (no value) for an auto-named file in `./reports/`, or `-o foo.csv` for an explicit path. |
+| `--json [PATH]` | *(off)* | JSON output — single object with the full schema (connections, persistence, logs, web-shell findings, flow summary, DNS findings). SIEM-friendly. PATH optional. |
+| `--ndjson [PATH]` | *(off)* | Newline-delimited JSON — one JSON object per line. Streams cleanly into Splunk HEC, ELK, etc. |
 | `--no-html` / `--no-text` | *(off)* | Disable the corresponding report (each is on by default). |
-| `--capture` | *(off)* | Capture packets via `pktmon` / `tcpdump`. Requires admin/root. |
-| `--save-capture [PATH]` | *(off)* | Save the raw pcap and embed a browsable packet log in the HTML report. PATH is optional — bare `--save-capture` writes `reports/netmon-<TS>.pcap` next to the CSV/HTML from the same run. Implies `--capture`. Prompts for confirmation (disk-usage warning) unless `--yes`. |
-| `--yes` | *(off)* | Auto-confirm prompts (e.g. for `--save-capture`). For non-interactive / scripted use. |
+| `--capture` | *(off)* | Capture packets via `pktmon` / `tcpdump`. **Saves the pcap by default** to `./reports/netmon-<TS>.pcap` so the HTML's "Load packets" feature works. Requires admin/root. |
+| `--capture-fly` | *(off)* | Capture packets but **don't save** the pcap — ephemeral capture used purely for in-memory flow analysis. Smaller footprint when you don't need to drill into bytes later. |
+| `--save-capture [PATH]` | *(off)* | Explicitly choose a pcap path (overrides the `--capture` default location). Implies `--capture`. Prompts for confirmation (disk-usage warning) unless `--yes`. |
+| `--yes` | *(off)* | Auto-confirm prompts (e.g. for `--save-capture`). For non-interactive / scripted use. `--tr` sets this automatically. |
+| **`--persistence`** | *(off)* | Enumerate host persistence mechanisms: cron, systemd unit files, registry Run keys, Windows scheduled tasks + services, macOS launchd, SSH `authorized_keys`, **PowerShell profiles** (Windows + POSIX PS 7). Recently-modified entries are flagged as IoCs. |
+| **`--hash-tasks`** | *(off)* | For every persistence entry, extract its binary path, compute SHA-256, and (when `--vt-api-key` is set) look it up in VirusTotal. The HTML hash becomes a click-through to `virustotal.com/gui/file/<hash>` so analysts can triage in one click. Implies `--persistence`. |
+| **`--scan-webroots`** | *(off)* | Walk webroot directories (`/var/www`, `/srv/http`, `C:\inetpub\wwwroot`, `htdocs`, etc.) and flag files matching web-shell signatures (Weevely, China Chopper, eval/base64 patterns). |
+| `--webroots PATHS` | *(auto)* | Override the default webroot list with comma-separated paths. Use when your stack puts content somewhere non-standard. |
+| **`--logs MINUTES`** | *(off)* | Tail the last N minutes of host event logs. Linux: `/var/log/{auth,syslog,apache,nginx,mysql,audit,fail2ban,crowdsec}`. Windows: Security / System / PowerShell Operational / Defender event logs (read in parallel). PII (passwords, tokens, JWTs, certs, emails) is scrubbed before rendering. Includes brute-force-then-success correlation. |
+| `--diff OLD.json NEW.json` | *(off)* | **No live monitor.** Diff two prior `--json` outputs and produce an HTML showing new / gone flows + risk transitions. Great for "what changed since last run?" |
 | `--vt-api-key` | `$VT_API_KEY` | VirusTotal API key. **Prefer the env var** — passing on the CLI exposes the key in process listings (`ps`, Task Manager). |
-| `--offline` | *(off)* | Skip GeoIP / threat-intel network calls |
-| `--scan-tor` | *(off)* | Fetch the Tor exit-list and flag connections to Tor exits. **Opt-in** because many ISPs SNI-filter `torproject.org` and the default-on behavior was a noisy false alarm. Enable when you actually want Tor-exit detection. |
-| `--no-signing` | *(off)* | Skip Authenticode signature verification |
-| `-v`, `-vv` |  | Increase logging verbosity (info / debug) |
-| `--version` |  | Print version and exit |
-| `-h`, `--help` |  | Show help |
+| `--offline` | *(off)* | Skip GeoIP / threat-intel network calls. |
+| `--scan-tor` | *(off)* | Fetch the Tor exit-list and flag connections to Tor exits. Opt-in because many ISPs SNI-filter `torproject.org`. |
+| `--no-signing` | *(off)* | Skip Authenticode signature verification. |
+| `--no-crowdsec` | *(off)* | Skip CrowdSec local-LAPI integration (Linux only — auto-detected from `/etc/crowdsec/local_api_credentials.yaml`). |
+| `--no-firewall` | *(off)* | Skip the firewall-state snapshot (ufw / nftables / iptables / Windows Firewall profile). |
+| `-v`, `-vv` |  | Increase logging verbosity (info / debug). |
+| `--version` |  | Print version and exit. |
+| `-h`, `--help` |  | Show help. |
 
 ### Exit codes
 
