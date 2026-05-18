@@ -50,13 +50,13 @@ except ImportError:
     HAS_IPWHOIS = False
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 log = logging.getLogger("netmon")
 
 # === Hard limits — defend against malicious / oversized input ===
 
-MAX_PCAP_BYTES = 256 * 1024 * 1024       # never process > 256 MB of pcap
+MAX_PCAP_BYTES = 512 * 1024 * 1024       # never process > 512 MB of pcap (bumped in v1.3 — BUG-1 removes the port filter, so captures can be larger)
 MAX_PACKET_SIZE = 65535 + 16             # snaplen + L2 header headroom
 MAX_PCAPNG_BLOCK = 1 * 1024 * 1024       # 1 MB per block is more than generous
 MAX_TOR_LIST_BYTES = 8 * 1024 * 1024     # Tor exit list is ~50 KB; cap at 8 MB
@@ -353,10 +353,21 @@ class FlowAnalyzer:
     def __init__(self):
         self.dns_queries = []                  # list of (qname, qtype, ts)
         self.dns_responses = defaultdict(set)  # qname -> {ip, ip, ...}
+        # v1.3: per-name RCODE histogram so the DNS-retry analyzer can
+        # distinguish NXDOMAIN bursts (potential C2 beacon DGA) from
+        # legitimate short-TTL resolutions (CDN PoP refresh, etc.).
+        self.dns_rcode_counts = defaultdict(dict)  # qname -> {rcode: count}
         self.sni_by_peer = defaultdict(set)    # remote_ip -> {sni, sni}
         self.bytes_per_peer = Counter()        # remote_ip -> total bytes
         self.packets_per_peer = Counter()
         self.errors = 0
+
+        # v1.3 — additional per-peer collections.
+        self.ja3_by_peer = defaultdict(set)            # F-1.6: remote_ip -> {ja3hash}
+        self.ja3_details = []                          # list of {ts, src, dst, ja3, ja3_hash, label}
+        self.icmp_payload_total_by_peer = Counter()    # F-1.3
+        self.icmp_packets_by_peer = Counter()
+        self.icmp_findings = []                        # F-1.3 derived findings
 
         # Detailed records — only populated when capture detail is requested.
         # Each list capped at MAX_DETAIL_RECORDS to bound memory.
@@ -454,6 +465,23 @@ class FlowAnalyzer:
         self._handle_l4(ts, src_ip, dst_ip, proto, payload)
 
     def _handle_l4(self, ts, src_ip, dst_ip, proto, payload):
+        # v1.3 F-1.3: ICMP echo tunnel heuristic. We track per-peer total
+        # packet count + accumulated payload bytes; in summary() we report a
+        # finding for any peer with ≥50 echo packets AND avg payload >1000.
+        # That signature catches stuff like ptunnel / icmpsh; legitimate
+        # echos rarely have payloads beyond the canned 32-56 bytes.
+        if proto in (1, 58):  # ICMP / ICMPv6
+            if len(payload) < 4:
+                return
+            icmp_type = payload[0]
+            # Only count Echo Request (8) / Echo Reply (0) / ICMPv6 Echo (128, 129)
+            if icmp_type not in (0, 8, 128, 129):
+                return
+            peer = dst_ip if icmp_type in (8, 128) else src_ip
+            data_len = max(0, len(payload) - 8)  # minus ICMP header
+            self.icmp_packets_by_peer[peer] += 1
+            self.icmp_payload_total_by_peer[peer] += data_len
+            return
         if proto == 6:  # TCP
             if len(payload) < 20:
                 return
@@ -514,6 +542,18 @@ class FlowAnalyzer:
             if tcp_payload:
                 if self._looks_like_tls_client_hello(tcp_payload):
                     sni = self._extract_sni(tcp_payload)
+                    # v1.3 F-1.6: extract JA3 fingerprint from the same Client
+                    # Hello while we have the parsed payload at hand.
+                    ja3_str, ja3_hash = self._extract_ja3(tcp_payload)
+                    if ja3_hash:
+                        self.ja3_by_peer[dst_ip].add(ja3_hash)
+                        label = KNOWN_BAD_JA3.get(ja3_hash, "")
+                        if len(self.ja3_details) < self.MAX_DETAIL_RECORDS:
+                            self.ja3_details.append({
+                                "ts": ts, "src": src_key, "dst": dst_key,
+                                "sni": sni or "", "ja3": ja3_str,
+                                "ja3_hash": ja3_hash, "label": label,
+                            })
                     if sni:
                         self.sni_by_peer[dst_ip].add(sni)
                         tls_key = (src_key, dst_key, sni)
@@ -720,6 +760,17 @@ class FlowAnalyzer:
             idx += ext_len
         return None
 
+    def _extract_ja3(self, data):
+        """Extract the JA3 fingerprint (string + md5) from a TLS Client Hello
+        record. Wraps `compute_ja3` after peeling the TLS record + handshake
+        headers (5 + 4 bytes) so it matches the spec's "starts at ClientHello
+        version" definition. Returns (ja3_str, ja3_hash) or (None, None).
+        """
+        n = len(data)
+        if n < 9 or data[0] != 0x16 or data[5] != 0x01:
+            return None, None
+        return compute_ja3(data[9:])
+
     def _extract_dns_query(self, data):
         if len(data) < 12:
             return None, None
@@ -740,6 +791,11 @@ class FlowAnalyzer:
         flags = struct.unpack("!H", data[2:4])[0]
         if not (flags & 0x8000):
             return  # not a response
+        # v1.3: track RCODE so the DNS-retry heuristic can distinguish
+        # NXDOMAIN bursts (potential C2 beacon) from legitimate short-TTL
+        # re-resolution (CDN PoP, Windows Update etc.). RCODE = low nibble
+        # of flags. 0 = NOERROR, 3 = NXDOMAIN.
+        rcode = flags & 0x000F
         qdcount, ancount = struct.unpack("!HH", data[4:8])
         # Cap counts to defang malicious headers (uint16 max = 65535).
         if qdcount > MAX_DNS_QDCOUNT or ancount > MAX_DNS_ANCOUNT:
@@ -751,6 +807,12 @@ class FlowAnalyzer:
             if qname is None or idx + 4 > len(data):
                 return
             idx += 4
+        # Record NXDOMAIN-per-name BEFORE walking ANSWERS (which may be empty
+        # for NXDOMAIN). This lets the analyzer compute NXDOMAIN ratio.
+        if qname:
+            self.dns_rcode_counts[qname][rcode] = (
+                self.dns_rcode_counts[qname].get(rcode, 0) + 1
+            )
         for _ in range(ancount):
             _name, idx = self._read_dns_name(data, idx)
             if idx + 10 > len(data):
@@ -811,6 +873,8 @@ class FlowAnalyzer:
         return names
 
     def summary(self):
+        # Derive ICMP-tunnel findings on demand (cheap; runs once per report).
+        self._compute_icmp_findings()
         return {
             "dns_query_count": len(self.dns_queries),
             "unique_dns_names": len({q[0] for q in self.dns_queries}),
@@ -818,7 +882,27 @@ class FlowAnalyzer:
             "unique_sni_names": len({s for v in self.sni_by_peer.values() for s in v}),
             "tracked_peer_count": len(self.bytes_per_peer),
             "parse_errors": self.errors,
+            "ja3_unique": len({h for v in self.ja3_by_peer.values() for h in v}),
+            "ja3_c2_matches": sum(1 for v in self.ja3_by_peer.values()
+                                  for h in v if h in KNOWN_BAD_JA3),
+            "icmp_tunnel_findings": len(self.icmp_findings),
         }
+
+    def _compute_icmp_findings(self):
+        """Materialize per-peer ICMP-tunnel findings using the thresholds in
+        ICMP_TUNNEL_MIN_PACKETS / ICMP_TUNNEL_MIN_AVG_PAYLOAD."""
+        self.icmp_findings = []
+        for peer, pkts in self.icmp_packets_by_peer.items():
+            if pkts < ICMP_TUNNEL_MIN_PACKETS:
+                continue
+            total = self.icmp_payload_total_by_peer.get(peer, 0)
+            avg = total / pkts if pkts else 0
+            if avg >= ICMP_TUNNEL_MIN_AVG_PAYLOAD:
+                self.icmp_findings.append({
+                    "peer": peer, "packets": pkts,
+                    "avg_payload": round(avg, 1),
+                    "total_payload": total,
+                })
 
 
 # === DNS analyzer (heuristics over captured DNS queries) ===
@@ -834,10 +918,14 @@ class DNSAnalyzer:
       - High retry counts to NXDOMAIN names (resolver beacon signal)
     """
 
-    def __init__(self, queries):
+    def __init__(self, queries, rcode_counts=None):
         # queries: list of (qname, qtype, ts) from FlowAnalyzer
+        # rcode_counts: optional dict[qname] -> {rcode: count} from
+        # FlowAnalyzer.dns_rcode_counts; enables NXDOMAIN-aware HIGH_RETRY
+        # classification. When None, falls back to count-only heuristic.
         self.queries = list(queries) if queries else []
         self.query_counts = Counter(q[0] for q in self.queries if q and q[0])
+        self.rcode_counts = dict(rcode_counts) if rcode_counts else {}
         self.flags_by_name = defaultdict(list)  # qname -> [flag, flag, ...]
 
     @staticmethod
@@ -910,10 +998,28 @@ class DNSAnalyzer:
                 self.flags_by_name[qname].append("DNS_INVALID_CHARS")
                 break
 
-        # 4. High retry count (typical of beacon DGA on NXDOMAIN)
+        # 4. High retry count — NXDOMAIN-aware classification.
+        #
+        # The original v1.3 heuristic flagged ANY name queried 20+ times as
+        # DNS_HIGH_RETRY, but legitimate short-TTL CDN re-resolutions (e.g.
+        # Cloudflare/Edge update endpoints) routinely hit 20+ in a 30-second
+        # capture. Now we look at the RCODE distribution:
+        #   - high count + mostly NXDOMAIN (rcode=3) → DNS_HIGH_RETRY_NXDOMAIN
+        #     (HIGH severity — classic beacon DGA pattern)
+        #   - high count + mostly NOERROR → DNS_HIGH_RETRY (LOW severity — just
+        #     a chatty short-TTL endpoint; informational, not alarming)
+        #   - high count + no RCODE data (UDP responses lost / pure query log)
+        #     → DNS_HIGH_RETRY (LOW — can't distinguish without responses)
         cnt = self.query_counts[qname]
         if cnt >= DNS_HIGH_RETRY_THRESHOLD:
-            self.flags_by_name[qname].append(f"DNS_HIGH_RETRY_{cnt}")
+            rcodes = self.rcode_counts.get(qname, {})
+            total_responses = sum(rcodes.values())
+            nxdomain_responses = rcodes.get(3, 0)
+            if total_responses > 0 and nxdomain_responses / total_responses >= 0.5:
+                self.flags_by_name[qname].append(
+                    f"DNS_HIGH_RETRY_NXDOMAIN_{cnt}")
+            else:
+                self.flags_by_name[qname].append(f"DNS_HIGH_RETRY_{cnt}")
 
     def suspicious_summary(self):
         """Return rows for the HTML report: list of dicts."""
@@ -960,15 +1066,15 @@ class PacketCapture:
             self._etl_path = os.path.join(tmp, "capture.etl")
             self.capture_path = os.path.join(tmp, "capture.pcapng")
             try:
+                # BUG-1 fix (v1.3): clear any pre-existing filter so we capture
+                # traffic on ALL ports, not just 53/80/443. The Load Packets
+                # feature was unusable for any service on a non-standard port
+                # (sshd:22, mysql:3306, redis:6379, …). With --pkt-size 512
+                # truncating each packet the storage cost stays bounded.
                 subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=10, check=False)
-                for port in (53, 80, 443):
-                    subprocess.run(
-                        ["pktmon", "filter", "add", "-t", "TCP", "UDP", "-p", str(port)],
-                        capture_output=True, timeout=10, check=False,
-                    )
                 subprocess.run(
                     ["pktmon", "start", "--capture", "--file", self._etl_path,
-                     "--pkt-size", "512", "--file-size", "256"],
+                     "--pkt-size", "512", "--file-size", "512"],
                     capture_output=True, text=True, timeout=15, check=False,
                 )
                 return True
@@ -978,10 +1084,14 @@ class PacketCapture:
                 return False
         if self.tool == "tcpdump":
             self.capture_path = os.path.join(tmp, "capture.pcap")
+            # BUG-1 fix (v1.3): no port filter — capture every TCP/UDP packet.
+            # The Load Packets feature in the HTML now works for ALL services
+            # (sshd, databases, custom apps) instead of just the v1.2 hard-
+            # coded triple 53/80/443. Default snaplen 512 bounds per-pkt cost.
             cmd = [
                 "tcpdump", "-i", "any", "-w", self.capture_path,
                 "-G", str(self.duration), "-W", "1", "-s", "512", "-q", "-nn",
-                "(port 80 or port 443 or port 53)",
+                "(tcp or udp)",
             ]
             try:
                 self.proc = subprocess.Popen(
@@ -1123,6 +1233,732 @@ class SignatureChecker:
         return subject.strip()
 
 
+# === Linux distro package-manager trust (T1-1) ===
+
+# Linux packages whose presence in distro repos is a trust signal. Equivalent
+# to Windows' TRUSTED_PUBLISHERS — owning-package match against this list lets
+# the binary skip UNSIGNED_BINARY / UNSIGNED_OUTBOUND_C2 penalties.
+TRUSTED_LINUX_PACKAGES = frozenset({
+    # OpenSSH / shell access
+    "openssh-server", "openssh-client", "openssh-sftp-server",
+    # Web servers
+    "apache2", "apache2-bin", "apache", "httpd", "nginx", "nginx-common",
+    "lighttpd", "caddy",
+    # Databases
+    "postgresql", "postgresql-15", "postgresql-16", "mysql-server",
+    "mariadb-server", "redis-server", "memcached", "mongodb-org-server",
+    # Mail
+    "dovecot-core", "postfix", "exim4", "exim4-daemon-light",
+    # Network / file sharing
+    "samba", "samba-common-bin", "smbd", "nmbd", "cups", "cups-daemon",
+    # System / init
+    "systemd", "systemd-sysv", "dbus", "dbus-daemon", "avahi-daemon",
+    "chrony", "ntp", "openntpd",
+    # Security tooling
+    "crowdsec", "crowdsec-firewall-bouncer-iptables",
+    "crowdsec-firewall-bouncer-nftables",
+    "fail2ban", "ufw", "iptables", "nftables", "firewalld",
+    # Container / virtualization
+    "docker.io", "docker-ce", "containerd", "podman", "lxc", "lxd",
+    "qemu-system-x86", "libvirt-daemon-system",
+    # Languages / runtimes
+    "python3", "python3-minimal", "perl-base", "ruby", "openjdk-17-jre-headless",
+    # Core utilities
+    "coreutils", "util-linux", "bash", "dash", "tar", "gzip", "less",
+})
+
+
+class LinuxPackageChecker:
+    """Linux analogue of SignatureChecker. For each binary path:
+
+    1. Resolves the owning package via dpkg / rpm / pacman / apk.
+    2. Verifies integrity vs the package manifest. Mismatch → PACKAGE_TAMPERED.
+    3. Maps to a trust verdict in the same shape as Windows Authenticode:
+       {signed, publisher, status, trusted}.
+
+    Cached per-path; only enabled on Linux.
+    """
+
+    SKIPPED: ClassVar[dict] = {"signed": False, "publisher": None, "status": "skipped", "trusted": False, "tampered": False}
+    UNKNOWN: ClassVar[dict] = {"signed": False, "publisher": None, "status": "unknown", "trusted": False, "tampered": False}
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled and sys.platform.startswith("linux")
+        self.cache = {}
+        self._distro = self._detect_distro() if self.enabled else None
+
+    @staticmethod
+    def _detect_distro():
+        """Return one of 'debian' / 'rpm' / 'arch' / 'alpine' / None."""
+        # Prefer the actual tool presence — some Debian-derived systems may have
+        # rpm installed too, but dpkg is authoritative when /var/lib/dpkg exists.
+        if shutil.which("dpkg") and os.path.isdir("/var/lib/dpkg"):
+            return "debian"
+        if shutil.which("rpm"):
+            return "rpm"
+        if shutil.which("pacman"):
+            return "arch"
+        if shutil.which("apk"):
+            return "alpine"
+        return None
+
+    def get(self, path):
+        if not self.enabled or not path or path in ("N/A", "Access Denied"):
+            return dict(self.SKIPPED)
+        return self.cache.get(path, dict(self.UNKNOWN))
+
+    @staticmethod
+    def _is_safe_path(path):
+        if not path or len(path) > 4096:
+            return False
+        return not any(c in path for c in PATH_FORBIDDEN_CHARS)
+
+    def batch_check(self, paths):
+        """Resolve each unique path. We don't actually batch into one
+        subprocess (the package tools take a path per invocation), but we do
+        cache + skip duplicates."""
+        if not self.enabled or not self._distro:
+            return
+        candidates = {p for p in paths if p and p not in ("N/A", "Access Denied")}
+        for p in candidates:
+            if p in self.cache:
+                continue
+            if not self._is_safe_path(p):
+                log.warning("pkg-check: refusing unsafe path %r", p)
+                self.cache[p] = dict(self.UNKNOWN)
+                continue
+            try:
+                if not os.path.isfile(p):
+                    self.cache[p] = dict(self.UNKNOWN)
+                    continue
+            except OSError:
+                self.cache[p] = dict(self.UNKNOWN)
+                continue
+            self.cache[p] = self._lookup(p)
+
+    def _lookup(self, path):
+        try:
+            if self._distro == "debian":
+                return self._lookup_debian(path)
+            if self._distro == "rpm":
+                return self._lookup_rpm(path)
+            if self._distro == "arch":
+                return self._lookup_arch(path)
+            if self._distro == "alpine":
+                return self._lookup_alpine(path)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("pkg-check failed for %s: %s", path, e)
+        return dict(self.UNKNOWN)
+
+    def _run(self, cmd, timeout=10):
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False,
+        )
+
+    def _verdict(self, package, tampered):
+        """Wrap a package-name + tampered-bool into the standard signature
+        dict shape (signed/publisher/status/trusted) so the rest of the code
+        path doesn't need to special-case Linux."""
+        if not package:
+            return {"signed": False, "publisher": None, "status": "unpackaged",
+                    "trusted": False, "tampered": False}
+        if tampered:
+            return {"signed": True, "publisher": package, "status": "tampered",
+                    "trusted": False, "tampered": True}
+        trusted = any(t in package.lower() for t in TRUSTED_LINUX_PACKAGES)
+        return {"signed": True, "publisher": package,
+                "status": f"pkg:{package}", "trusted": trusted, "tampered": False}
+
+    def _lookup_debian(self, path):
+        # dpkg -S returns "<pkg>: <path>"; multiple packages possible if file
+        # belongs to several. We take the first.
+        r = self._run(["dpkg", "-S", path])
+        if r.returncode != 0 or not r.stdout.strip():
+            return self._verdict(None, False)
+        pkg = r.stdout.split(":", 1)[0].strip().split(",")[0].strip()
+        if not pkg:
+            return self._verdict(None, False)
+        # Verify integrity. `dpkg -V <pkg>` prints nothing on clean, lines
+        # like "??5?????? c /etc/foo" on mismatch (5 = md5 sum diff).
+        verify = self._run(["dpkg", "-V", pkg], timeout=20)
+        tampered = False
+        for raw in (verify.stdout or "").splitlines():
+            stripped = raw.rstrip()
+            if not stripped:
+                continue
+            # Skip config files marked 'c' (operator-edited /etc/ is normal).
+            cols = stripped.split()
+            if len(cols) >= 2 and cols[1] == "c":
+                continue
+            # 5 in the first column = md5 mismatch on a non-config file.
+            if cols and "5" in cols[0]:
+                tampered = True
+                break
+        return self._verdict(pkg, tampered)
+
+    def _lookup_rpm(self, path):
+        r = self._run(["rpm", "-qf", "--queryformat", "%{NAME}", path])
+        if r.returncode != 0 or not r.stdout.strip():
+            return self._verdict(None, False)
+        # "not owned by any package" message goes to stderr, returncode=1
+        pkg = r.stdout.strip().split("\n")[0]
+        if pkg.startswith("file ") and "not owned" in pkg:
+            return self._verdict(None, False)
+        verify = self._run(["rpm", "-V", pkg], timeout=20)
+        tampered = False
+        for raw in (verify.stdout or "").splitlines():
+            stripped = raw.rstrip()
+            if not stripped:
+                continue
+            cols = stripped.split()
+            # Config files start with 'c'; skip them.
+            if len(cols) >= 2 and cols[1] == "c":
+                continue
+            # First column "S.5...." — '5' anywhere in the verify flags = md5
+            # mismatch on a non-config file.
+            if cols and "5" in cols[0]:
+                tampered = True
+                break
+        return self._verdict(pkg, tampered)
+
+    def _lookup_arch(self, path):
+        r = self._run(["pacman", "-Qo", path])
+        if r.returncode != 0 or not r.stdout.strip():
+            return self._verdict(None, False)
+        # Output: "/usr/bin/sshd is owned by openssh 9.0p1-1"
+        m = re.search(r"owned by (\S+)", r.stdout)
+        if not m:
+            return self._verdict(None, False)
+        pkg = m.group(1)
+        # pacman -Qkk verifies integrity; "0 altered files" = clean.
+        verify = self._run(["pacman", "-Qkk", pkg], timeout=20)
+        tampered = "altered" in (verify.stdout or "").lower() and " 0 " not in (verify.stdout or "")
+        return self._verdict(pkg, tampered)
+
+    def _lookup_alpine(self, path):
+        r = self._run(["apk", "info", "--who-owns", path])
+        if r.returncode != 0 or not r.stdout.strip():
+            return self._verdict(None, False)
+        # Output: "/usr/sbin/sshd is owned by openssh-server-9.7_p1-r4"
+        m = re.search(r"owned by (\S+)", r.stdout)
+        if not m:
+            return self._verdict(None, False)
+        pkg = m.group(1)
+        # apk has no per-package verify equivalent that's quick + scriptable;
+        # `apk audit --packages` is global. Skip tamper detection for Alpine
+        # to avoid a multi-second wait per run.
+        return self._verdict(pkg, False)
+
+
+# === macOS code-signing checker (T1-4) ===
+
+# Apple-shipped Authority subjects we trust outright. Apple Developer IDs
+# also pass once the cert chain anchors to Apple Root CA.
+TRUSTED_MACOS_SIGNERS = (
+    "Software Signing",
+    "Apple Mac OS Application Signing",
+    "Developer ID Application: Mozilla Corporation",
+    "Developer ID Application: Google",
+    "Developer ID Application: Microsoft Corporation",
+    "Developer ID Application: Anthropic",
+    "Developer ID Application: GitHub",
+    "Developer ID Application: JetBrains",
+    "Developer ID Application: Docker",
+    "Developer ID Application: Homebrew",
+)
+
+
+class MacOSSignatureChecker:
+    """codesign / spctl wrapper for macOS, same shape as SignatureChecker."""
+
+    SKIPPED: ClassVar[dict] = {"signed": False, "publisher": None, "status": "skipped", "trusted": False}
+    UNKNOWN: ClassVar[dict] = {"signed": False, "publisher": None, "status": "unknown", "trusted": False}
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled and sys.platform == "darwin" and bool(shutil.which("codesign"))
+        self.cache = {}
+
+    def get(self, path):
+        if not self.enabled or not path or path in ("N/A", "Access Denied"):
+            return dict(self.SKIPPED)
+        return self.cache.get(path, dict(self.UNKNOWN))
+
+    @staticmethod
+    def _is_safe_path(path):
+        if not path or len(path) > 4096:
+            return False
+        return not any(c in path for c in PATH_FORBIDDEN_CHARS)
+
+    def batch_check(self, paths):
+        if not self.enabled:
+            return
+        for p in {p for p in paths if p and p not in ("N/A", "Access Denied")}:
+            if p in self.cache:
+                continue
+            if not self._is_safe_path(p):
+                log.warning("codesign: refusing unsafe path %r", p)
+                self.cache[p] = dict(self.UNKNOWN)
+                continue
+            try:
+                if not os.path.isfile(p):
+                    self.cache[p] = dict(self.UNKNOWN)
+                    continue
+            except OSError:
+                self.cache[p] = dict(self.UNKNOWN)
+                continue
+            self.cache[p] = self._verify(p)
+
+    def _verify(self, path):
+        try:
+            r = subprocess.run(
+                ["codesign", "-dv", "--verbose=4", path],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            # codesign emits the cert chain on stderr; stdout is usually empty.
+            text = (r.stderr or "") + "\n" + (r.stdout or "")
+            if "not signed at all" in text or (r.returncode == 1 and "code object is not signed" in text):
+                return {"signed": False, "publisher": None,
+                        "status": "NotSigned", "trusted": False}
+            authority = None
+            for line in text.splitlines():
+                if line.startswith("Authority="):
+                    authority = line.split("=", 1)[1].strip()
+                    break
+            if not authority:
+                return {"signed": False, "publisher": None,
+                        "status": "unknown", "trusted": False}
+            # Verify integrity (-v checks the signature seals the binary).
+            verify = subprocess.run(
+                ["codesign", "--verify", "--deep", path],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if verify.returncode != 0:
+                return {"signed": False, "publisher": authority,
+                        "status": "InvalidSignature", "trusted": False}
+            trusted = any(t in authority for t in TRUSTED_MACOS_SIGNERS)
+            return {"signed": True, "publisher": authority,
+                    "status": "Valid", "trusted": trusted}
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("codesign failed for %s: %s", path, e)
+            return dict(self.UNKNOWN)
+
+
+# === Server-binary role registry (T1-3) ===
+# Binaries that are EXPECTED to listen and accept inbound connections. When
+# a process from this list has an inbound connection on (one of) its standard
+# port(s), C2-style flags are suppressed.
+
+SERVER_BINARY_ROLES = {
+    # binary basename -> set of standard listen ports
+    "sshd":             {22},
+    "apache2":          {80, 443, 8080, 8443},
+    "apache":           {80, 443, 8080, 8443},
+    "httpd":            {80, 443, 8080, 8443},
+    "nginx":            {80, 443, 8080, 8443},
+    "lighttpd":         {80, 443},
+    "caddy":            {80, 443, 2019},
+    "postgres":         {5432},
+    "postgresql":       {5432},
+    "mysqld":           {3306},
+    "mariadbd":         {3306},
+    "redis-server":     {6379},
+    "memcached":        {11211},
+    "mongod":           {27017},
+    "dovecot":          {110, 143, 993, 995},
+    "postfix":          {25, 465, 587},
+    "exim4":            {25, 465, 587},
+    "smbd":             {139, 445},
+    "nmbd":             {137, 138},
+    "cupsd":            {631},
+    "crowdsec":         {8080, 6060},
+    "crowdsec-firewall-bouncer": set(),  # no listener role; out-of-band
+    "systemd-resolved": {53, 5355},
+    "systemd-networkd": set(),
+    "avahi-daemon":     {5353},
+    "chronyd":          {123, 323},
+    "ntpd":             {123},
+    "named":            {53},
+    "unbound":          {53},
+}
+
+
+def _normalize_app_name(app_name):
+    """Lowercase + strip a trailing '.exe' suffix without using rstrip
+    (which would strip any characters in the set '.exe', mangling names
+    like 'nginx' → 'ngin')."""
+    if not app_name:
+        return ""
+    name = app_name.lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
+
+
+def is_server_binary(app_name):
+    """Return True if the executable basename is a known server role."""
+    return _normalize_app_name(app_name) in SERVER_BINARY_ROLES
+
+
+def server_expected_port(app_name, port):
+    """Return True if `port` is one of the server's known-good listen ports."""
+    if not app_name or port is None:
+        return False
+    role = SERVER_BINARY_ROLES.get(_normalize_app_name(app_name))
+    if role is None:
+        return False
+    return port in role
+
+
+# === Direction classification (T1-2) ===
+
+def _read_linux_ephemeral_range():
+    """Read /proc/sys/net/ipv4/ip_local_port_range. Default if unreadable."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            parts = f.read().split()
+            if len(parts) == 2:
+                lo, hi = int(parts[0]), int(parts[1])
+                if 1 <= lo <= 65535 and lo <= hi <= 65535:
+                    return lo, hi
+    except (OSError, ValueError):
+        pass
+    return 32768, 60999  # Linux default since ~2.6
+
+
+# Cache the kernel's ephemeral range once per process — it's a sysctl, not
+# something that changes during a run.
+_EPHEMERAL_LO, _EPHEMERAL_HI = (
+    _read_linux_ephemeral_range() if sys.platform.startswith("linux")
+    else (49152, 65535)  # IANA / Windows default
+)
+
+
+def _is_ephemeral_port(port):
+    if port is None:
+        return False
+    return _EPHEMERAL_LO <= port <= _EPHEMERAL_HI
+
+
+def classify_direction(local, remote, status):
+    """Return 'INBOUND' / 'OUTBOUND' / 'LOOPBACK' / 'LISTEN' / 'AMBIGUOUS' / None.
+
+    Direction heuristic, tried in order:
+      1. The side holding the ephemeral port (per the OS sysctl range) is the
+         client; the other side is the server.
+      2. Failing that, the side with a well-known port (< 1024) is the server.
+      3. Tie-breaker: the larger port wins as the client side.
+
+    The cascading rules let us classify both clear (sshd accepts inbound :22)
+    and ambiguous (45000 → 443 on Windows where 45000 sits below the default
+    ephemeral floor of 49152) cases without losing the v1.2 default for
+    ordinary outbound HTTPS.
+    """
+    if not remote:
+        return "LISTEN" if (status or "").upper() in ("LISTEN", "NONE") else None
+    # Extract ports
+    def _port(addr):
+        if not addr:
+            return None
+        try:
+            if addr.startswith("["):
+                return int(addr.split("]:", 1)[1])
+            return int(addr.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            return None
+
+    def _ip(addr):
+        if not addr:
+            return None
+        if addr.startswith("["):
+            return addr.split("]")[0][1:]
+        parts = addr.rsplit(":", 1)
+        return parts[0] if len(parts) == 2 else None
+
+    remote_ip = _ip(remote)
+    if remote_ip and (remote_ip.startswith("127.") or remote_ip == "::1"):
+        return "LOOPBACK"
+
+    lport = _port(local)
+    rport = _port(remote)
+    if lport is None or rport is None:
+        return "AMBIGUOUS"
+    l_eph = _is_ephemeral_port(lport)
+    r_eph = _is_ephemeral_port(rport)
+    if l_eph and not r_eph:
+        return "OUTBOUND"
+    if r_eph and not l_eph:
+        return "INBOUND"
+    # Cascade 2: well-known service port (< 1024). Whoever owns it is the server.
+    if rport < 1024 <= lport:
+        return "OUTBOUND"
+    if lport < 1024 <= rport:
+        return "INBOUND"
+    # Cascade 3: bigger port = more likely client (rough but effective when
+    # both sides are in the 1024-49152 user-port window).
+    if lport > rport:
+        return "OUTBOUND"
+    if rport > lport:
+        return "INBOUND"
+    return "AMBIGUOUS"
+
+
+# === CrowdSec integration (T2-1) ===
+
+class CrowdSecClient:
+    """Query the local CrowdSec Local API for IP verdicts.
+
+    Probes 127.0.0.1:8080 first (default LAPI port); if reachable and an API
+    token is provided (--crowdsec-token, $CROWDSEC_LAPI_KEY, or auto-detected
+    from /etc/crowdsec/local_api_credentials.yaml), looks up each public IP.
+
+    No external network calls — CrowdSec runs on the same host.
+    """
+
+    DEFAULT_HOST = "127.0.0.1"
+    DEFAULT_PORT = 8080
+
+    def __init__(self, token=None, host=None, port=None, console=None):
+        self.console = console
+        self.host = host or self.DEFAULT_HOST
+        self.port = port or self.DEFAULT_PORT
+        self.token = token or os.environ.get("CROWDSEC_LAPI_KEY") or self._read_local_creds()
+        self.cache = {}
+        self.enabled = bool(self.token) and self._probe_heartbeat()
+
+    def _read_local_creds(self):
+        """Parse /etc/crowdsec/local_api_credentials.yaml for the password
+        (used as the API key for the local LAPI). Best effort — file is root-
+        only by default, so this works when netmon is invoked as root."""
+        path = "/etc/crowdsec/local_api_credentials.yaml"
+        try:
+            if not os.path.isfile(path):
+                return None
+            with open(path) as f:
+                for raw in f:
+                    stripped = raw.strip()
+                    # password: <hex>
+                    m = re.match(r"^password:\s*(\S+)\s*$", stripped)
+                    if m:
+                        return m.group(1).strip().strip('"').strip("'")
+        except OSError:
+            return None
+        return None
+
+    def _probe_heartbeat(self):
+        """Cheap one-shot probe — bail quickly if no CrowdSec listening."""
+        try:
+            r = requests.get(
+                f"http://{self.host}:{self.port}/v1/heartbeat",
+                headers={"X-Api-Key": self.token},
+                timeout=2,
+            )
+            return r.status_code in (200, 401, 403)
+        except requests.RequestException:
+            return False
+
+    def lookup(self, ip):
+        """Return one of: 'clean' / 'ban' / 'captcha' / 'throttle' / None."""
+        if not self.enabled or not ip:
+            return None
+        if ip in self.cache:
+            return self.cache[ip]
+        # Skip lookups for private / loopback IPs — CrowdSec wouldn't have
+        # opinions about LAN endpoints anyway.
+        if classify_local_ip(ip) is not None:
+            self.cache[ip] = None
+            return None
+        try:
+            r = requests.get(
+                f"http://{self.host}:{self.port}/v1/decisions",
+                headers={"X-Api-Key": self.token},
+                params={"ip": ip},
+                timeout=3,
+            )
+            if r.status_code != 200:
+                self.cache[ip] = None
+                return None
+            decisions = r.json() or []
+            if not decisions:
+                self.cache[ip] = "clean"
+                return "clean"
+            # If any decision is active, take the strictest action.
+            actions = {(d.get("type") or "").lower() for d in decisions}
+            for verdict in ("ban", "captcha", "throttle"):
+                if verdict in actions:
+                    self.cache[ip] = verdict
+                    return verdict
+            self.cache[ip] = "ban"  # unknown action, treat conservatively
+            return "ban"
+        except (requests.RequestException, ValueError) as e:
+            log.debug("crowdsec lookup failed for %s: %s", ip, e)
+            self.cache[ip] = None
+            return None
+
+
+# === systemd unit attribution (T2-2) ===
+
+def systemd_unit_for_pid(pid):
+    """Resolve a PID to its owning systemd unit by reading /proc/<pid>/cgroup.
+
+    Linux-only; returns None on other platforms or unmapped PIDs.
+
+    Format (cgroup v2):
+      0::/system.slice/sshd.service
+      0::/user.slice/user-1000.slice/session-2.scope
+    """
+    if not sys.platform.startswith("linux") or not pid:
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/cgroup") as f:
+            content = f.read()
+    except (OSError, ValueError):
+        return None
+    # Look for system.slice/<unit>.service or user@*/app.slice/<unit>.service
+    for line in content.splitlines():
+        # Each line is "hierarchy:controller:path"
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        path = parts[2]
+        m = re.search(r"/([^/]+\.service)(?:/|$)", path)
+        if m:
+            return m.group(1)
+        m = re.search(r"/([^/]+\.scope)(?:/|$)", path)
+        if m:
+            return m.group(1)
+    return None
+
+
+# === Firewall state inspection (T2-3) ===
+
+class FirewallState:
+    """Snapshot of the host firewall — per-port allow/deny verdict.
+
+    Reads ufw / iptables-save / nft / Windows NetFirewallRule. Best-effort:
+    a "no rules / accept-all" host returns 'allowed' for everything; a
+    parse failure returns 'unknown'.
+    """
+
+    def __init__(self):
+        self.backend = None
+        # port -> 'allowed' / 'blocked' / 'lan-only'
+        self.rules = {}
+        # Map of allowed ports → human description (for display)
+        self.descriptions = {}
+        # Default chain policy (input). 'allow' if firewall is off / inactive.
+        self.default_allow = True
+        self._gather()
+
+    def _gather(self):
+        if sys.platform.startswith("linux"):
+            self._gather_linux()
+        elif sys.platform == "win32":
+            self._gather_windows()
+
+    def _gather_linux(self):
+        # Try ufw first (it's a friendly wrapper on top of iptables/nftables).
+        if shutil.which("ufw"):
+            try:
+                r = subprocess.run(["ufw", "status", "verbose"],
+                                   capture_output=True, text=True, timeout=5, check=False)
+                out = r.stdout or ""
+                if "Status: active" in out:
+                    self.backend = "ufw"
+                    # Default policy line: "Default: deny (incoming), allow (outgoing), …"
+                    if re.search(r"Default:.*deny \(incoming\)", out):
+                        self.default_allow = False
+                    # Rule lines: "22/tcp                     ALLOW       Anywhere"
+                    for line in out.splitlines():
+                        m = re.match(r"\s*(\d+)(?:/(tcp|udp))?\s+(ALLOW|DENY|LIMIT)\s+(.+)", line)
+                        if m:
+                            port = int(m.group(1))
+                            verdict = m.group(3)
+                            src = m.group(4).strip()
+                            if verdict == "ALLOW":
+                                # LAN-only if source is restricted to private range
+                                lan_only = bool(re.search(
+                                    r"(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|fc|fd|fe80:)",
+                                    src.lower(),
+                                ))
+                                self.rules[port] = "lan-only" if lan_only else "allowed"
+                                self.descriptions[port] = src
+                            elif verdict == "DENY":
+                                self.rules[port] = "blocked"
+                                self.descriptions[port] = src
+                    return
+            except (OSError, subprocess.SubprocessError) as e:
+                log.debug("ufw probe failed: %s", e)
+        # Fall back to nftables / iptables-save: we don't fully parse them;
+        # the default-deny / default-allow flag from the chain policies is
+        # the most actionable signal.
+        if shutil.which("nft"):
+            try:
+                r = subprocess.run(["nft", "list", "ruleset"],
+                                   capture_output=True, text=True, timeout=5, check=False)
+                out = r.stdout or ""
+                if out.strip():
+                    self.backend = "nft"
+                    # Look for "policy drop" on chain input
+                    if re.search(r"chain input\s*\{[^}]*policy drop", out, re.S | re.I):
+                        self.default_allow = False
+                    elif re.search(r"chain input\s*\{[^}]*policy accept", out, re.S | re.I):
+                        self.default_allow = True
+                    return
+            except (OSError, subprocess.SubprocessError) as e:
+                log.debug("nft probe failed: %s", e)
+        if shutil.which("iptables-save"):
+            try:
+                r = subprocess.run(["iptables-save"],
+                                   capture_output=True, text=True, timeout=5, check=False)
+                out = r.stdout or ""
+                if out.strip():
+                    self.backend = "iptables"
+                    # ":INPUT DROP [0:0]" vs ":INPUT ACCEPT [0:0]"
+                    m = re.search(r"^:INPUT (\w+)", out, re.M)
+                    if m:
+                        self.default_allow = m.group(1).upper() == "ACCEPT"
+                    return
+            except (OSError, subprocess.SubprocessError) as e:
+                log.debug("iptables-save probe failed: %s", e)
+
+    def _gather_windows(self):
+        """Use PowerShell Get-NetFirewallProfile to determine the default
+        inbound action. Per-port rule enumeration is heavy and most users
+        rely on the profile default."""
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-NetFirewallProfile -Profile Domain,Private,Public | "
+                 "Select-Object Name,Enabled,DefaultInboundAction | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return
+            self.backend = "netsh"
+            data = json.loads(r.stdout)
+            if isinstance(data, dict):
+                data = [data]
+            # If ANY active profile blocks inbound, treat default as deny.
+            self.default_allow = True
+            for profile in data:
+                enabled = profile.get("Enabled") in (True, 1, "True")
+                action = (profile.get("DefaultInboundAction") or "").lower()
+                if enabled and action in ("block", "2"):
+                    self.default_allow = False
+                    break
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as e:
+            log.debug("Windows firewall probe failed: %s", e)
+
+    def verdict_for_port(self, port):
+        """Return 'allowed' / 'blocked' / 'lan-only' / 'unknown' for the port."""
+        if not self.backend:
+            return "unknown"
+        if port in self.rules:
+            return self.rules[port]
+        # No explicit rule — fall back to default chain policy.
+        return "allowed" if self.default_allow else "blocked"
+
+
 # === Threat intel: Tor exits, ipwhois enrichment ===
 
 def _safe_cache_dir():
@@ -1225,6 +2061,1718 @@ def describe_listener_exposure(local_addr):
         except ValueError:
             pass
     return f"listening — interface {ip}"
+
+
+def _fmt_age(seconds):
+    """Human-readable age string ('3.2s' / '4h 22m' / '2d 1h')."""
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return "—"
+    if s < 0:
+        s = 0.0
+    if s < 60:
+        return f"{s:.1f}s"
+    if s < 3600:
+        return f"{int(s // 60)}m {int(s % 60)}s"
+    if s < 86400:
+        return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
+    return f"{int(s // 86400)}d {int((s % 86400) // 3600)}h"
+
+
+# === v1.3: Suspicious command-line detection (F-5.1) ========================
+
+# Patterns that indicate an attacker dropping a payload or executing
+# obfuscated code on the host. Each entry: (regex, flag-suffix, severity).
+SUSPICIOUS_CMDLINE_PATTERNS = [
+    # PowerShell encoded / hidden execution. We allow ANY characters between
+    # the binary name and the target flag (other flags/values) because real
+    # cmdlines look like 'powershell.exe -nop -w hidden -enc AAAA'.
+    (re.compile(r"(?i)\bpowershell(?:\.exe)?\b[^|;]*?\s-e(?:c|nc|ncodedCommand)\b"),
+     "PS_ENCODED",     "HIGH"),
+    (re.compile(r"(?i)\bpowershell(?:\.exe)?\b[^|;]*?\s-w(?:indowstyle)?\s+hidden\b"),
+     "PS_HIDDEN",      "HIGH"),
+    (re.compile(r"(?i)(?:iex|invoke-expression)\s*\(\s*new-object\s+net\.webclient\)\."),
+     "PS_DOWNLOAD",    "HIGH"),
+    (re.compile(r"(?i)(?:iex|invoke-expression)\s*\(\s*\[?\s*system\.text\.encoding"),
+     "PS_DECODE_EXEC", "HIGH"),
+    (re.compile(r"(?i)\bfrombase64string\b"),
+     "PS_FROMBASE64",  "HIGH"),
+    # Living-off-the-land binaries used for download
+    (re.compile(r"(?i)\bcertutil(?:\.exe)?\s+(?:-[a-z]+\s+)*-urlcache\b"),
+     "CERTUTIL_DOWNLOAD", "HIGH"),
+    (re.compile(r"(?i)\bbitsadmin(?:\.exe)?\s+(?:/[a-z]+\s+)*\b/transfer\b"),
+     "BITSADMIN_TRANSFER", "HIGH"),
+    (re.compile(r"(?i)\bmshta(?:\.exe)?\s+(?:javascript:|vbscript:|https?://)"),
+     "MSHTA_HTTP",     "HIGH"),
+    (re.compile(r"(?i)\brundll32(?:\.exe)?\s+\S+,\s*\S+"),
+     "RUNDLL32_CALL",  "MED"),
+    (re.compile(r"(?i)\bregsvr32(?:\.exe)?\s+(?:/[a-z]+\s+)*/i:https?://"),
+     "REGSVR32_HTTP",  "HIGH"),
+    # Curl/wget piped into a shell — classic dropper
+    (re.compile(r"(?i)\b(?:curl|wget)\s+[^|]+\|\s*(?:bash|sh|zsh|powershell)"),
+     "DOWNLOAD_PIPE_SHELL", "HIGH"),
+    (re.compile(r"(?i)\bbash\s+-c\s+[\"']\$\(\s*(?:curl|wget)\b"),
+     "BASH_C_CURL",    "HIGH"),
+    # Reverse shell one-liners
+    (re.compile(r"(?i)\bbash\s+-i\s+>&\s+/dev/tcp/"),
+     "BASH_REV_SHELL", "HIGH"),
+    (re.compile(r"(?i)\bnc(?:at)?\s+(?:-[a-z]+\s+)*-e\s+(?:/bin/)?(?:bash|sh|cmd)"),
+     "NC_REV_SHELL",   "HIGH"),
+    (re.compile(r"(?i)python[23]?\s+-c\s+[\"'][^\"']*socket\.socket[^\"']*subprocess"),
+     "PYTHON_REV_SHELL", "HIGH"),
+    # Long base64 blob in cmdline (likely encoded payload)
+    (re.compile(r"[A-Za-z0-9+/]{200,}={0,2}"),
+     "LONG_BASE64",    "MED"),
+    # WMI lateral movement
+    (re.compile(r"(?i)\bwmic\s+.*\bprocess\s+call\s+create\b"),
+     "WMIC_PROC_CREATE", "HIGH"),
+    # Scheduled-task creation via cmdline
+    (re.compile(r"(?i)\bschtasks(?:\.exe)?\s+(?:/[a-z]+\s+)*/create\b"),
+     "SCHTASKS_CREATE", "MED"),
+]
+
+
+def analyze_cmdline(cmdline):
+    """Return (highest_severity, [flags]) for a process cmdline. cmdline may
+    be a list (from psutil) or a single string."""
+    if not cmdline:
+        return None, []
+    if isinstance(cmdline, list):
+        text = " ".join(cmdline)
+    else:
+        text = str(cmdline)
+    if len(text) > 16384:
+        text = text[:16384]  # bound regex work on pathological argv
+    flags = []
+    worst = None
+    severity_rank = {"HIGH": 2, "MED": 1, "LOW": 0}
+    for rx, suffix, sev in SUSPICIOUS_CMDLINE_PATTERNS:
+        if rx.search(text):
+            flags.append(f"SUSPICIOUS_CMDLINE_{suffix}")
+            if worst is None or severity_rank[sev] > severity_rank[worst]:
+                worst = sev
+    return worst, flags
+
+
+# === v1.3: Web-shell detection (F-2.x) ======================================
+
+# Process names that constitute "web server runtime" — used by F-2.1 to
+# detect spawn anomalies and F-2.5 to flag web-user outbound.
+WEB_SERVER_PROCESSES = frozenset({
+    "apache2", "apache", "httpd", "nginx", "lighttpd", "caddy",
+    "php-fpm", "php-fpm7", "php-fpm8", "php-cgi", "php",
+    "w3wp", "w3wp.exe",
+    "node", "java", "tomcat", "catalina",
+    "gunicorn", "uwsgi", "unicorn", "puma",
+})
+
+# Web-user accounts whose outbound network access is suspicious by default.
+WEB_USER_ACCOUNTS = frozenset({
+    "www-data", "apache", "nginx", "httpd", "_www", "_apache",
+    "iusr", "iis apppool", "network service",
+    "php-fpm", "tomcat", "jetty",
+})
+
+# Shells / interpreters / network tools that should NEVER be a child of a
+# web server (F-2.1).
+CHILD_PROCESS_BLOCKLIST = frozenset({
+    "bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh", "ash",
+    "cmd.exe", "cmd", "powershell.exe", "powershell", "pwsh", "pwsh.exe",
+    "nc", "ncat", "netcat", "socat",
+    "curl", "wget", "rclone",
+    "python", "python2", "python3", "perl", "ruby",
+    "ssh", "scp", "sftp",
+    "whoami", "id", "hostname", "uname",
+})
+
+# Regex signatures for known web-shell content. Mostly language-agnostic
+# heuristics, plus a few specific-shell fingerprints (Weevely, China Chopper,
+# B374K). Patterns are intentionally conservative — false positives on
+# legitimate framework code are worse than missing one shell out of ten.
+WEBSHELL_SIGNATURES = [
+    # === PHP web shells ===
+    (re.compile(rb"(?i)\beval\s*\(\s*base64_decode\s*\("),
+     "PHP_EVAL_BASE64",  "HIGH"),
+    (re.compile(rb"(?i)\beval\s*\(\s*gzinflate\s*\(\s*base64_decode"),
+     "PHP_GZINFLATE_B64", "HIGH"),
+    (re.compile(rb"(?i)\bassert\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)\b"),
+     "PHP_ASSERT_INPUT", "HIGH"),
+    (re.compile(rb"(?i)\b(?:system|exec|shell_exec|passthru|popen)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)\b"),
+     "PHP_EXEC_INPUT",   "HIGH"),
+    (re.compile(rb"(?i)\bpreg_replace\s*\([^)]*['\"]/e['\"]"),
+     "PHP_PREG_E_FLAG",  "HIGH"),
+    (re.compile(rb"(?i)\$_(?:GET|POST|REQUEST|COOKIE)\s*\[\s*['\"][a-z0-9_]{1,3}['\"]?\s*\]\s*\(\s*\$_"),
+     "PHP_DYNAMIC_FN",   "HIGH"),
+    # Weevely-specific marker: small alpha key + base64 in a header / GET arg
+    (re.compile(rb"(?i)str_replace\s*\(\s*['\"]\\\\['\"].*?\)\s*\(\s*str_rot13"),
+     "WEEVELY_LIKELY",   "HIGH"),
+    # China Chopper one-liner
+    (re.compile(rb"<%@\s*Page\s+Language=['\"][CcVv][^'\"]*['\"]\s*%>[\s\S]{0,200}Eval\s*\(\s*Request"),
+     "CHINA_CHOPPER_ASP", "HIGH"),
+    # === ASP/.NET web shells ===
+    (re.compile(rb"(?i)<%[^%]{0,200}Eval\s*\(\s*Request\b"),
+     "ASP_EVAL_REQUEST", "HIGH"),
+    (re.compile(rb"(?i)System\.Diagnostics\.Process\.Start\s*\(\s*Request"),
+     "ASPNET_PROC_REQ",  "HIGH"),
+    # === JSP web shells ===
+    (re.compile(rb"(?i)Runtime\.getRuntime\(\)\.exec\s*\(\s*request\.getParameter"),
+     "JSP_RUNTIME_EXEC", "HIGH"),
+    (re.compile(rb"(?i)new\s+ProcessBuilder\s*\(\s*request\.getParameter"),
+     "JSP_PROC_BUILDER", "HIGH"),
+    # === Generic ===
+    (re.compile(rb"(?i)\bcmd=\s*[\"'].*?[&\";'].*?exec\b"),
+     "GENERIC_CMD_EXEC", "MED"),
+]
+
+# Webroot directories scanned by --scan-webroots.
+DEFAULT_WEBROOTS = [
+    "/var/www/html", "/var/www", "/srv/http", "/srv/www",
+    "/usr/share/nginx/html", "/usr/local/apache2/htdocs",
+    "/usr/local/www/apache24/data",
+    r"C:\inetpub\wwwroot",
+    r"C:\xampp\htdocs", r"C:\wamp64\www",
+]
+# Extensions to scan; bounded so we don't crawl whole-disk static assets.
+WEBSHELL_SCAN_EXTENSIONS = frozenset({
+    ".php", ".php3", ".php4", ".php5", ".phtml", ".phar",
+    ".asp", ".aspx", ".ashx", ".asmx", ".cer",
+    ".jsp", ".jspx", ".jsf",
+    ".cgi", ".pl", ".py",
+})
+
+
+class WebShellScanner:
+    """Scan webroot directories for known shell-content signatures.
+
+    Single-pass, bounded: per-file size cap, total-file cap, total-time cap.
+    Designed to run during a normal monitor session in under a second on
+    a typical webroot. NOT a replacement for a proper YARA scanner, but
+    catches the loud, common patterns (Weevely, China Chopper, eval/base64).
+    """
+
+    MAX_FILE_BYTES = 1 * 1024 * 1024     # 1 MB per file
+    MAX_FILES = 5000                     # never scan more files than this
+    MAX_TIME_SECONDS = 30.0              # bail at 30s total
+
+    def __init__(self, roots=None):
+        self.roots = list(roots) if roots else list(DEFAULT_WEBROOTS)
+        self.findings = []   # list of dicts: {path, mtime, flags}
+
+    def scan(self):
+        deadline = time.time() + self.MAX_TIME_SECONDS
+        scanned = 0
+        for root in self.roots:
+            if scanned >= self.MAX_FILES or time.time() > deadline:
+                break
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                if scanned >= self.MAX_FILES or time.time() > deadline:
+                    break
+                # Skip large vendored / cache directories that explode walk time.
+                dirnames[:] = [d for d in dirnames
+                               if d not in ("node_modules", "vendor", ".git", "cache")]
+                for name in filenames:
+                    if scanned >= self.MAX_FILES or time.time() > deadline:
+                        break
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext not in WEBSHELL_SCAN_EXTENSIONS:
+                        continue
+                    path = os.path.join(dirpath, name)
+                    scanned += 1
+                    try:
+                        st = os.stat(path)
+                        if st.st_size > self.MAX_FILE_BYTES:
+                            continue
+                        with open(path, "rb") as f:
+                            data = f.read(self.MAX_FILE_BYTES)
+                    except OSError:
+                        continue
+                    flags = []
+                    for rx, suffix, _sev in WEBSHELL_SIGNATURES:
+                        if rx.search(data):
+                            flags.append(f"WEBSHELL_SIGNATURE_{suffix}")
+                    if flags:
+                        self.findings.append({
+                            "path": path,
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                            "flags": flags,
+                        })
+        return self.findings
+
+
+def is_web_server_process(app_name):
+    """True iff app_name is a known web-server process."""
+    if not app_name:
+        return False
+    return _normalize_app_name(app_name) in WEB_SERVER_PROCESSES
+
+
+def is_web_user(username):
+    """True iff username is one of the web-runtime user accounts. Matches
+    case-insensitively and handles both 'IIS APPPOOL\\foo' and 'iis apppool'."""
+    if not username:
+        return False
+    name = username.lower().strip()
+    if name in WEB_USER_ACCOUNTS:
+        return True
+    # Windows IIS app-pool accounts like "IIS APPPOOL\\DefaultAppPool"
+    if name.startswith("iis apppool"):
+        return True
+    if "\\" in name:
+        domain, _, local = name.partition("\\")
+        if domain == "iis apppool":
+            return True
+    return False
+
+
+def is_blocklisted_child(app_name):
+    """True iff app_name should NOT be spawned by a web server."""
+    if not app_name:
+        return False
+    return _normalize_app_name(app_name) in CHILD_PROCESS_BLOCKLIST
+
+
+# === v1.3: Persistence enumeration (F-4) ====================================
+
+class PersistenceScanner:
+    """Enumerate host persistence mechanisms (cron, systemd, registry Run,
+    scheduled tasks, launchd, authorized_keys). Bounded — never traverses
+    the whole filesystem, only known persistence paths."""
+
+    # Anything modified within this window is flagged as "recent" — a likely
+    # IoC if the operator wasn't expecting changes.
+    RECENT_DAYS = 14
+
+    def __init__(self):
+        self.findings = []   # list of dicts: {kind, name, path, mtime, command, recent}
+
+    def scan(self):
+        if sys.platform.startswith("linux"):
+            self._scan_linux()
+        elif sys.platform == "win32":
+            self._scan_windows()
+        elif sys.platform == "darwin":
+            self._scan_macos()
+        # SSH key persistence checked on POSIX hosts
+        if hasattr(os, "getuid"):
+            self._scan_ssh_keys()
+        # PowerShell profiles — cross-platform persistence mechanism (PS7
+        # runs on Linux/macOS too). Anything in a profile runs on every
+        # PowerShell launch, which makes them a textbook persistence channel.
+        self._scan_ps_profiles()
+        return self.findings
+
+    def _is_recent(self, mtime):
+        try:
+            age_days = (time.time() - float(mtime)) / 86400
+            return age_days <= self.RECENT_DAYS
+        except (TypeError, ValueError):
+            return False
+
+    def _add(self, kind, name, path, command="", mtime=None):
+        self.findings.append({
+            "kind": kind,
+            "name": name,
+            "path": path,
+            "command": command,
+            "mtime": mtime,
+            "recent": self._is_recent(mtime) if mtime is not None else False,
+            # v1.3: filled in by hash_task_binaries() when --hash-tasks runs.
+            "binary_path": None,
+            "binary_hash": None,
+            "vt":          None,
+        })
+
+    # --- Linux ---
+    def _scan_linux(self):
+        # 1. systemd unit-files (enabled only — disabled units don't run)
+        if shutil.which("systemctl"):
+            try:
+                r = subprocess.run(
+                    ["systemctl", "list-unit-files", "--state=enabled",
+                     "--no-pager", "--no-legend", "--plain"],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                for line in (r.stdout or "").splitlines():
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    unit = parts[0]
+                    # Look up unit file path + mtime
+                    path = self._systemd_unit_path(unit)
+                    mtime = None
+                    if path:
+                        try:
+                            mtime = os.path.getmtime(path)
+                        except OSError:
+                            mtime = None
+                    self._add("systemd", unit, path or "", mtime=mtime)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        # 2. crontabs — root + per-user
+        for cron_dir in ("/etc/cron.d", "/etc/cron.hourly", "/etc/cron.daily",
+                         "/etc/cron.weekly", "/etc/cron.monthly",
+                         "/var/spool/cron/crontabs", "/var/spool/cron"):
+            if not os.path.isdir(cron_dir):
+                continue
+            try:
+                for name in os.listdir(cron_dir):
+                    path = os.path.join(cron_dir, name)
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        continue
+                    if not stat_mod.S_ISREG(st.st_mode):
+                        continue
+                    # Read first line of cron job as the "command"
+                    cmd = ""
+                    try:
+                        with open(path, errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line and not line.startswith("#"):
+                                    cmd = line[:400]
+                                    break
+                    except OSError:
+                        pass
+                    self._add("cron", name, path, command=cmd, mtime=st.st_mtime)
+            except OSError:
+                continue
+        # 3. rc-local / init.d / profile.d (legacy persistence)
+        for path in ("/etc/rc.local", "/etc/profile"):
+            if os.path.isfile(path):
+                try:
+                    mtime = os.path.getmtime(path)
+                    self._add("rc", os.path.basename(path), path, mtime=mtime)
+                except OSError:
+                    pass
+
+    def _systemd_unit_path(self, unit):
+        """Resolve a unit name to its file path via `systemctl show -p FragmentPath`."""
+        try:
+            r = subprocess.run(
+                ["systemctl", "show", "-p", "FragmentPath", "--value", unit],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            p = (r.stdout or "").strip()
+            return p if p else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    # --- Windows ---
+    def _scan_windows(self):
+        # Scheduled tasks (JSON output, parsed in-process)
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-ScheduledTask | Where-Object {$_.State -ne 'Disabled'} | "
+                 "Select-Object TaskName, TaskPath, "
+                 "@{N='Command';E={($_.Actions | ForEach-Object {$_.Execute + ' ' + $_.Arguments}) -join '; '}}, "
+                 "@{N='LastRun';E={(Get-ScheduledTaskInfo $_).LastRunTime}}, "
+                 "@{N='NextRun';E={(Get-ScheduledTaskInfo $_).NextRunTime}} | "
+                 "ConvertTo-Json -Compress -Depth 3"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if r.stdout.strip():
+                data = json.loads(r.stdout)
+                if isinstance(data, dict):
+                    data = [data]
+                for t in data[:500]:   # cap
+                    name = t.get("TaskName", "")
+                    path = (t.get("TaskPath") or "") + name
+                    cmd = (t.get("Command") or "").strip()
+                    # No easy mtime for tasks; use NextRun as a proxy "recent"
+                    self._add("sched_task", name, path, command=cmd, mtime=None)
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            pass
+
+        # Registry Run keys
+        run_keys = [
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run",
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+            r"HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run",
+        ]
+        for key in run_keys:
+            try:
+                r = subprocess.run(
+                    ["reg", "query", key],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                if r.returncode != 0:
+                    continue
+                for line in (r.stdout or "").splitlines():
+                    # Format: "    Name    REG_SZ    Value"
+                    m = re.match(r"\s+(\S+)\s+REG_(?:SZ|EXPAND_SZ)\s+(.+)$", line)
+                    if m:
+                        self._add("reg_run", m.group(1), key,
+                                  command=m.group(2).strip()[:400], mtime=None)
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+        # Auto-start services
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance -ClassName Win32_Service | "
+                 "Where-Object {$_.StartMode -eq 'Auto' -and $_.State -ne 'Running'} | "
+                 "Select-Object Name, DisplayName, PathName | "
+                 "ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if r.stdout.strip():
+                data = json.loads(r.stdout)
+                if isinstance(data, dict):
+                    data = [data]
+                for s in data[:500]:
+                    self._add("service", s.get("Name", ""), s.get("DisplayName", ""),
+                              command=(s.get("PathName") or "").strip()[:400], mtime=None)
+        except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+            pass
+
+    # --- macOS ---
+    def _scan_macos(self):
+        for d in ("/Library/LaunchAgents", "/Library/LaunchDaemons",
+                  os.path.expanduser("~/Library/LaunchAgents")):
+            if not os.path.isdir(d):
+                continue
+            try:
+                for name in os.listdir(d):
+                    if not name.endswith(".plist"):
+                        continue
+                    path = os.path.join(d, name)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        mtime = None
+                    self._add("launchd", name, path, mtime=mtime)
+            except OSError:
+                continue
+
+    # --- SSH keys ---
+    def _scan_ssh_keys(self):
+        for home in self._candidate_homes():
+            ak = os.path.join(home, ".ssh", "authorized_keys")
+            if not os.path.isfile(ak):
+                continue
+            try:
+                st = os.stat(ak)
+            except OSError:
+                continue
+            try:
+                with open(ak, errors="ignore") as f:
+                    keys = [line.strip() for line in f
+                            if line.strip() and not line.startswith("#")]
+            except OSError:
+                continue
+            for key_line in keys:
+                # Take the comment (last whitespace-separated chunk) as the "name"
+                parts = key_line.split()
+                comment = parts[-1] if len(parts) >= 3 else "(no-comment)"
+                self._add("ssh_key", comment, ak,
+                          command=(key_line[:60] + "…" if len(key_line) > 60 else key_line),
+                          mtime=st.st_mtime)
+
+    # --- PowerShell profile scan (cross-platform) ---
+    def _scan_ps_profiles(self):
+        """Enumerate every PowerShell profile file on the host.
+
+        PS profiles are textbook persistence: anything in profile.ps1 runs
+        on every PowerShell launch. We list them here so an analyst sees
+        them alongside cron/registry-Run/scheduled-tasks. The first non-
+        empty, non-comment line of each profile is shown as the 'command'
+        so suspicious additions surface immediately.
+
+        On Windows hosts both PS 5.1 paths and PS 7 paths are checked. On
+        POSIX hosts only PS 7 paths are checked (PS 7 runs on Linux/macOS).
+        """
+        candidates = []
+        home = os.path.expanduser("~")
+        if sys.platform == "win32":
+            ps_documents = os.path.join(home, "Documents")
+            candidates.extend([
+                # Windows PowerShell 5.1
+                os.path.join(ps_documents, "WindowsPowerShell",
+                             "profile.ps1"),
+                os.path.join(ps_documents, "WindowsPowerShell",
+                             "Microsoft.PowerShell_profile.ps1"),
+                # PowerShell 7+
+                os.path.join(ps_documents, "PowerShell", "profile.ps1"),
+                os.path.join(ps_documents, "PowerShell",
+                             "Microsoft.PowerShell_profile.ps1"),
+                # All-users PS 5.1
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\profile.ps1",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0"
+                r"\Microsoft.PowerShell_profile.ps1",
+                # All-users PS 7
+                r"C:\Program Files\PowerShell\7\profile.ps1",
+                r"C:\Program Files\PowerShell\7"
+                r"\Microsoft.PowerShell_profile.ps1",
+            ])
+        else:
+            # PS 7 on POSIX uses XDG-like paths.
+            candidates.extend([
+                os.path.join(home, ".config", "powershell", "profile.ps1"),
+                os.path.join(home, ".config", "powershell",
+                             "Microsoft.PowerShell_profile.ps1"),
+                "/usr/local/microsoft/powershell/7/profile.ps1",
+                "/etc/powershell/profile.ps1",
+            ])
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            # Capture the first 200 chars of the FIRST non-empty, non-comment
+            # line so the analyst sees what the profile actually does. Suspicious
+            # profile contents (Invoke-Expression, IEX, encoded base64) will
+            # surface in the persistence section's flag column.
+            first_real = ""
+            try:
+                with open(path, errors="ignore") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s and not s.startswith("#"):
+                            first_real = s[:200]
+                            break
+            except OSError:
+                pass
+            self._add(
+                "ps_profile",
+                os.path.basename(path),
+                path,
+                command=first_real or "(empty profile)",
+                mtime=st.st_mtime,
+            )
+
+    # Known executable suffixes — used by extract_binary_path to recognize
+    # the end of an unquoted Windows path that includes spaces.
+    _BIN_EXTENSIONS = (
+        ".exe", ".dll", ".com", ".bat", ".cmd", ".ps1",
+        ".py", ".sh", ".vbs", ".vbe", ".msi", ".jar",
+    )
+
+    @staticmethod
+    def extract_binary_path(command):
+        """Best-effort: pull the executable path out of a persistence-entry
+        command string. Handles:
+          "C:\\Program Files\\Foo\\bar.exe" /args
+          'C:\\Foo\\bar.exe' /args
+          C:\\Program Files\\Foo\\bar.exe /silent     (unquoted, has spaces)
+          C:\\Foo\\bar.exe /args
+          /usr/local/bin/foo --flag
+          %SystemRoot%\\system32\\svchost.exe -k Net
+        Returns the resolved absolute path (env vars expanded) or None.
+        """
+        if not command or not isinstance(command, str):
+            return None
+        s = command.strip()
+        # Quoted path — take the contents between matching quotes.
+        if s.startswith('"'):
+            end = s.find('"', 1)
+            if end > 1:
+                cand = s[1:end]
+            else:
+                return None
+        elif s.startswith("'"):
+            end = s.find("'", 1)
+            if end > 1:
+                cand = s[1:end]
+            else:
+                return None
+        else:
+            # Unquoted. Default: first whitespace-delimited token.
+            parts = s.split()
+            if not parts:
+                return None
+            cand = parts[0]
+            # Windows-path-with-spaces correction (e.g. scheduled-task action
+            # `C:\Program Files\Adobe\Acrobat.exe /silent` arrives unquoted
+            # from PowerShell). If the first token DOESN'T end with a known
+            # executable extension AND looks like a Windows drive-letter path,
+            # keep absorbing tokens until we hit one ending in `.exe`/`.dll`/…
+            # or a token that looks like a CLI flag (`-`, `/x`).
+            looks_winabs = (len(cand) >= 2 and cand[1] == ":") or cand.startswith("\\\\")
+            if (looks_winabs
+                    and not cand.lower().endswith(PersistenceScanner._BIN_EXTENSIONS)
+                    and len(parts) > 1):
+                for w in parts[1:]:
+                    # CLI flag → end of path. Bound the look-like-flag length
+                    # to avoid mistaking a directory name "-Recover-Old-State"
+                    # for a flag.
+                    if (w.startswith("-") or w.startswith("/")) and len(w) < 40:
+                        break
+                    cand = cand + " " + w
+                    if cand.lower().endswith(PersistenceScanner._BIN_EXTENSIONS):
+                        break
+        if not cand:
+            return None
+        # Expand env vars on Windows ($env or %VAR%); leave POSIX vars alone
+        # since persistence files normally store absolute paths.
+        try:
+            cand = os.path.expandvars(cand)
+            cand = os.path.expanduser(cand)
+        except (TypeError, ValueError):
+            return None
+        # Sanity: must be at least one path separator OR an absolute path.
+        if not (os.path.sep in cand or cand.startswith(("/", "\\"))
+                or (len(cand) > 2 and cand[1] == ":")):
+            return None
+        # Bound length defensively before passing to filesystem.
+        if len(cand) > 4096:
+            return None
+        return cand
+
+    def _candidate_homes(self):
+        homes = set()
+        try:
+            with open("/etc/passwd", errors="ignore") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) >= 6 and parts[5].startswith("/"):
+                        homes.add(parts[5])
+        except OSError:
+            pass
+        # And the current user's home (covers macOS / non-passwd hosts)
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            homes.add(home)
+        return sorted(homes)
+
+
+# === v1.3: Host event log review (F-3, --logs N) ============================
+
+class LogReader:
+    """Tail-N-minutes log readers for Linux + Windows.
+
+    Each `read_*` method returns a list of dicts:
+      {timestamp, source, severity, event_id, user, src_ip, message}
+
+    All readers honor a per-source size cap and total time budget so a giant
+    log can't OOM us.
+    """
+
+    MAX_BYTES_PER_SOURCE = 50 * 1024 * 1024     # 50 MB per log file
+    MAX_ENTRIES_PER_SOURCE = 5000               # cap collected entries
+    MAX_TIME_SECONDS = 20.0                     # hard ceiling for the entire pass
+
+    # Privacy: strings to scrub from collected log entries.
+    SCRUB_PATTERNS = [
+        re.compile(r"password=[^&\s]+",                    re.IGNORECASE),
+        re.compile(r"passwd=[^&\s]+",                      re.IGNORECASE),
+        re.compile(r"token=[A-Za-z0-9._\-]{12,}",          re.IGNORECASE),
+        re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----"),
+        re.compile(r"\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),  # emails
+        re.compile(r"\bey[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\b"),  # JWT
+    ]
+
+    def __init__(self, minutes):
+        self.minutes = max(1, min(int(minutes), 1440))
+        self.cutoff = time.time() - self.minutes * 60
+        self.entries = []
+        self.deadline = time.time() + self.MAX_TIME_SECONDS
+        self.sources_read = []
+        # v1.3: track per-source access errors so the operator sees WHY a log
+        # contributed zero entries — typically because the PowerShell session
+        # lacks admin and Security log needs it. Saved as list of
+        # (source, reason).
+        self.sources_skipped = []
+
+    def read_all(self):
+        if sys.platform.startswith("linux"):
+            self._read_linux()
+        elif sys.platform == "win32":
+            self._read_windows()
+        elif sys.platform == "darwin":
+            self._read_macos()
+        # Sort newest-first
+        self.entries.sort(key=lambda e: e.get("timestamp_unix", 0), reverse=True)
+        return self.entries
+
+    def _scrub(self, message):
+        if not message:
+            return ""
+        for rx in self.SCRUB_PATTERNS:
+            message = rx.sub("[REDACTED]", message)
+        if len(message) > 800:
+            message = message[:800] + "…"
+        return message
+
+    def _add(self, source, ts_unix, severity, event_id, user, src_ip, message):
+        if ts_unix < self.cutoff:
+            return
+        # v1.3: severity='SELF' marks an event netmon itself generated
+        # (PowerShell ScriptBlock compiles from our own child cmdlet calls).
+        # Hidden by default in the HTML, surfaced via a toggle so analysts
+        # can audit netmon's own runtime footprint on demand.
+        is_self = (severity == "SELF")
+        self.entries.append({
+            "timestamp_unix": ts_unix,
+            "timestamp": datetime.fromtimestamp(ts_unix).strftime("%Y-%m-%d %H:%M:%S"),
+            "source": source,
+            "severity": severity,
+            "event_id": event_id,
+            "user": user or "",
+            "src_ip": src_ip or "",
+            "message": self._scrub(message or ""),
+            "is_netmon_self": is_self,
+        })
+
+    # --- Linux ---
+
+    SYSLOG_RX = re.compile(
+        # Sep 12 14:23:45 hostname program[pid]: message
+        # or 2025-12-31T14:23:45+00:00 hostname program[pid]: message (RFC5424)
+        r"^(?P<ts>\S+\s+\S+\s+\S+|\S+T\S+)\s+(?P<host>\S+)\s+(?P<prog>[^\[\]:]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$"
+    )
+    APACHE_COMMON_RX = re.compile(
+        # 1.2.3.4 - - [01/Jan/2025:12:34:56 +0000] "POST /shell.php HTTP/1.1" 200 1234
+        r'^(?P<ip>\S+)\s+\S+\s+(?P<user>\S+)\s+\[(?P<ts>[^\]]+)\]\s+'
+        r'"(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<proto>[^"]+)"\s+(?P<status>\d+)\s+(?P<size>\S+)'
+    )
+    SSH_FAIL_RX = re.compile(
+        r"Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+) port"
+    )
+    SSH_OK_RX = re.compile(
+        r"Accepted (?:password|publickey) for (?P<user>\S+) from (?P<ip>\S+) port"
+    )
+
+    def _read_linux(self):
+        candidates = [
+            ("auth",    ["/var/log/auth.log", "/var/log/secure"]),
+            ("syslog",  ["/var/log/syslog", "/var/log/messages"]),
+            ("apache",  ["/var/log/apache2/access.log", "/var/log/httpd/access_log"]),
+            ("apache",  ["/var/log/apache2/error.log",  "/var/log/httpd/error_log"]),
+            ("nginx",   ["/var/log/nginx/access.log"]),
+            ("nginx",   ["/var/log/nginx/error.log"]),
+            ("mysql",   ["/var/log/mysql/error.log", "/var/log/mysqld.log"]),
+            ("audit",   ["/var/log/audit/audit.log"]),
+            ("crowdsec",["/var/log/crowdsec.log"]),
+            ("fail2ban",["/var/log/fail2ban.log"]),
+        ]
+        for source, paths in candidates:
+            if time.time() > self.deadline:
+                break
+            for p in paths:
+                if not os.path.isfile(p):
+                    continue
+                # Also consider rotated +.1 +.2.gz files whose mtime is in window
+                self._read_linux_file(source, p)
+                break  # only read one match per source
+
+    def _read_linux_file(self, source, path):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        # Seek backwards from EOF to limit work for long log files.
+        # We read at most MAX_BYTES_PER_SOURCE from the tail.
+        offset = max(0, size - self.MAX_BYTES_PER_SOURCE)
+        try:
+            with open(path, "r", errors="ignore") as f:
+                if offset:
+                    f.seek(offset)
+                    f.readline()  # discard partial first line
+                count = 0
+                for line in f:
+                    if count >= self.MAX_ENTRIES_PER_SOURCE:
+                        break
+                    self._parse_linux_line(source, line)
+                    count += 1
+        except OSError:
+            return
+        self.sources_read.append((source, path))
+
+    def _parse_linux_line(self, source, line):
+        line = line.rstrip("\n")
+        if not line:
+            return
+        # Apache/Nginx access log (Common / Combined Log Format)
+        if source in ("apache", "nginx") and (line.startswith(("1", "2", "3")) or line[0].isdigit()):
+            m = self.APACHE_COMMON_RX.match(line)
+            if m:
+                ts_unix = self._parse_apache_ts(m.group("ts"))
+                if ts_unix is None:
+                    return
+                method = m.group("method")
+                path = m.group("path")
+                status = m.group("status")
+                ip = m.group("ip")
+                # Risk classification at parse time (lets correlation skip noise)
+                sev = "LOW"
+                ev = f"HTTP_{status}"
+                if method == "POST" and any(path.lower().endswith(ext)
+                                            for ext in (".php", ".aspx", ".asp", ".jsp")):
+                    sev = "MED"
+                    ev = "HTTP_POST_SCRIPT"
+                if any(s in path for s in ("../", "%2e%2e", "etc/passwd", "/proc/")):
+                    sev = "HIGH"; ev = "PATH_TRAVERSAL_ATTEMPT"
+                if any(s in path.lower() for s in ("union+select", "union%20select", "' or '1'='1")):
+                    sev = "HIGH"; ev = "SQLI_ATTEMPT"
+                msg = f"{method} {path} → {status}"
+                self._add(source, ts_unix, sev, ev, "", ip, msg)
+                return
+        # Syslog-style line
+        m = self.SYSLOG_RX.match(line)
+        if not m:
+            return
+        ts_unix = self._parse_syslog_ts(m.group("ts"))
+        if ts_unix is None:
+            return
+        prog = m.group("prog") or ""
+        message = m.group("msg") or ""
+        # sshd Failed/Accepted
+        if "ssh" in prog.lower():
+            mf = self.SSH_FAIL_RX.search(message)
+            if mf:
+                self._add(source, ts_unix, "MED", "SSH_FAILED",
+                          mf.group("user"), mf.group("ip"),
+                          f"sshd: {message}")
+                return
+            mo = self.SSH_OK_RX.search(message)
+            if mo:
+                self._add(source, ts_unix, "LOW", "SSH_ACCEPTED",
+                          mo.group("user"), mo.group("ip"),
+                          f"sshd: {message}")
+                return
+        # sudo
+        if prog.lower().startswith("sudo"):
+            self._add(source, ts_unix, "MED", "SUDO", "", "",
+                      f"{prog}: {message}")
+            return
+        # systemd unit failure
+        if "systemd" in prog.lower() and ("Failed" in message or "failed" in message):
+            self._add(source, ts_unix, "MED", "SYSTEMD_FAIL", "", "",
+                      f"{prog}: {message}")
+            return
+        # Default — keep MED-or-higher only if the line has loud keywords
+        loud = any(kw in message.lower() for kw in
+                   ("error", "fail", "denied", "panic", "alert", "critical"))
+        if loud:
+            self._add(source, ts_unix, "LOW", prog or "msg", "", "", message)
+
+    def _parse_syslog_ts(self, ts):
+        # Try RFC5424 first
+        try:
+            if "T" in ts:
+                # 2025-12-31T14:23:45+00:00
+                clean = ts.split("+")[0].split("Z")[0]
+                if "." in clean:
+                    clean = clean.split(".")[0]
+                return datetime.fromisoformat(clean).timestamp()
+        except (ValueError, TypeError):
+            pass
+        # BSD syslog: "Sep 12 14:23:45" — no year. Assume current year.
+        try:
+            year = datetime.now().year
+            dt = datetime.strptime(f"{year} {ts}", "%Y %b %d %H:%M:%S")
+            # If parsed timestamp is in the future, it's actually last year.
+            if dt.timestamp() > time.time() + 3600:
+                dt = dt.replace(year=year - 1)
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    def _parse_apache_ts(self, ts):
+        # 01/Jan/2025:12:34:56 +0000
+        try:
+            return datetime.strptime(ts.split(" ")[0], "%d/%b/%Y:%H:%M:%S").timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    # --- Windows ---
+
+    # Event IDs we care about, keyed by log name.
+    # NOTE: 4104 (PS_SCRIPT_BLOCK) was previously HIGH globally — that produced
+    # a flood of false-positive HIGH alerts because the event fires for EVERY
+    # PowerShell script block compile, including netmon's own internal cmdlet
+    # calls (Get-AuthenticodeSignature, Get-ScheduledTask, Get-WinEvent…).
+    # It's now LOW by default; _classify_ps_scriptblock() upgrades to HIGH on
+    # genuine offensive-tradecraft patterns (FromBase64String, IEX, encoded
+    # commands, Invoke-Mimikatz, AMSI bypass, etc.) and skips netmon-self
+    # noise entirely.
+    WIN_EVENT_IDS = {
+        "Security": {
+            4624: ("LOW",  "LOGON_SUCCESS"),
+            4625: ("MED",  "LOGON_FAIL"),
+            4672: ("MED",  "SPECIAL_PRIV"),
+            4688: ("LOW",  "PROC_CREATE"),
+            4697: ("HIGH", "SVC_INSTALL"),
+            4698: ("HIGH", "SCHED_TASK_CREATE"),
+            4720: ("HIGH", "USER_CREATE"),
+            4732: ("HIGH", "ADD_TO_LOCAL_GROUP"),
+        },
+        "System": {
+            7045: ("HIGH", "SVC_INSTALL"),
+            7036: ("LOW",  "SVC_STATE"),
+        },
+        "Microsoft-Windows-PowerShell/Operational": {
+            4104: ("LOW",  "PS_SCRIPT_BLOCK"),   # promoted by classifier below
+            4103: ("LOW",  "PS_MODULE"),
+        },
+        "Microsoft-Windows-Windows Defender/Operational": {
+            1116: ("HIGH", "DEFENDER_DETECTED"),
+            1117: ("HIGH", "DEFENDER_ACTION"),
+            5007: ("MED",  "DEFENDER_CONFIG_CHANGE"),
+        },
+    }
+
+    # PowerShell ScriptBlock substrings that indicate offensive tradecraft.
+    # Match is case-insensitive; bumps severity to HIGH and rewrites event_id
+    # so analysts can immediately see WHY a 4104 was flagged.
+    # NOTE: each pattern is intentionally specific. Bare strings like "bypass"
+    # were tried in early v1.3 dev and produced massive false-positive volume
+    # because PowerShell module-definition scriptblocks (auto-emitted when ANY
+    # cmdlet from NetSecurity / NetTCPIP / etc. is loaded) contain enum names
+    # with "Bypass" in them.
+    PS_OFFENSIVE_PATTERNS = [
+        ("FromBase64String",                    "PS_BASE64_DECODE"),
+        ("[Convert]::FromBase64String",         "PS_BASE64_DECODE"),
+        ("[Reflection.Assembly]::Load",         "PS_REFLECTION_LOAD"),
+        ("DownloadString",                      "PS_DOWNLOAD_STRING"),
+        ("DownloadFile",                        "PS_DOWNLOAD_FILE"),
+        ("Net.WebClient",                       "PS_WEBCLIENT"),
+        ("Invoke-WebRequest",                   "PS_INVOKE_WEBREQ"),
+        ("Invoke-Mimikatz",                     "PS_MIMIKATZ"),
+        ("Mimikatz",                            "PS_MIMIKATZ"),
+        ("Invoke-DllInjection",                 "PS_DLL_INJECTION"),
+        ("Invoke-Shellcode",                    "PS_SHELLCODE"),
+        ("Invoke-ReflectivePEInjection",        "PS_PE_INJECTION"),
+        ("VirtualAllocEx",                      "PS_INJECTION_API"),
+        ("CreateRemoteThread",                  "PS_INJECTION_API"),
+        ("WriteProcessMemory",                  "PS_INJECTION_API"),
+        ("Add-MpPreference -Exclusion",         "PS_DEFENDER_TAMPER"),
+        ("Set-MpPreference -Disable",           "PS_DEFENDER_TAMPER"),
+        ("Set-MpPreference -ExclusionPath",     "PS_DEFENDER_TAMPER"),
+        ("amsiInitFailed",                      "PS_AMSI_BYPASS"),
+        ("AmsiUtils",                           "PS_AMSI_BYPASS"),
+        ("Net.Sockets.TcpClient",               "PS_RAW_SOCKET"),
+        ("Net.Sockets.UdpClient",               "PS_RAW_SOCKET"),
+        # Be specific about bypass — only the well-known abuse forms.
+        ("-ExecutionPolicy Bypass",             "PS_EXECPOLICY_BYPASS"),
+        ("-ep bypass",                          "PS_EXECPOLICY_BYPASS"),
+        ("Set-ExecutionPolicy Bypass",          "PS_EXECPOLICY_BYPASS"),
+        ("New-Object IO.MemoryStream",          "PS_MEMORY_LOAD"),
+    ]
+
+    # Strings that mark an EID 4103/4104 event as netmon's own internal
+    # PowerShell call or as PowerShell-runtime auto-compiled boilerplate (the
+    # CIM module's alias-init, the cmdletization parameter-validators, etc.).
+    # All such events are dropped entirely. The classifier below applies this
+    # filter to BOTH 4103 (PS_MODULE) and 4104 (PS_SCRIPT_BLOCK).
+    PS_NETMON_SELF_PATTERNS = [
+        # --- Cmdlets netmon invokes directly ---
+        "Get-AuthenticodeSignature",
+        "Get-ScheduledTask",
+        "Get-ScheduledTaskInfo",
+        "Get-NetFirewallProfile",
+        "Get-NetFirewallRule",
+        "Get-WinEvent",
+        "Get-CimInstance",
+        "Get-CimClass",
+        "Get-CimSession",
+        "[Console]::In.ReadLine",
+        # Where-Object filter literals used in netmon's PS commands.
+        "$_.StartMode -eq 'Auto'",
+        "$_.State -ne 'Disabled'",
+        "$_.State -ne 'Running'",
+        # --- PowerShell engine / module init boilerplate ---
+        # Every `powershell -Command ...` invocation triggers the engine to
+        # emit a $global:? scriptblock (readiness check) plus N Set-Alias
+        # scriptblocks when the CIM module loads (gcls=Get-CimClass,
+        # ncso=New-CimSessionOption, etc.). These are pure scaffolding.
+        "$global:?",
+        "Set-Alias -Name gcim",
+        "Set-Alias -Name gcls",
+        "Set-Alias -Name ncso",
+        "Set-Alias -Name gcms",
+        "Set-Alias -Name rcms",
+        "Set-Alias -Name ncms",
+        "Set-Alias -Name rcie",
+        "Set-Alias -Name gcai",
+        "Set-Alias -Name icim",
+        "Set-Alias -Name rcim",
+        "Set-Alias -Name ncim",
+        "Set-Alias -Name scim",
+        "Set-StrictMode",
+        # Cmdletization-backed module boilerplate (NetSecurity, NetTCPIP,
+        # ScheduledTasks, Storage…). Parameter validators with no operator-
+        # controlled content.
+        "PowerShell.Cmdletization.GeneratedTypes",
+        "PSCmdlet.ParameterSetName",
+        "__cmdletization_",                # catches BindCommonParameters,
+                                            # methodParameter, queryBuilder,
+                                            # objectModelWrapper, defaultValue,
+                                            # any future __cmdletization_*
+        "ParameterSetName='ByQuery'",
+        "ParameterSetName='ByName'",
+        # CIM infrastructure type-name strings emitted when ScheduledTask /
+        # Win32_Service / NetSecurity cmdlets compile their type bindings.
+        "Microsoft.Management.Infrastructure.CimInstance#",
+        # ValidateSet validator scriptblocks emitted for ScheduledTask params.
+        "@('Object') -contains",
+        "@('Name') -contains",
+        # netmon's own Get-ScheduledTask action-expression scriptblocks (the
+        # PowerShell `@{N='Command';E={...}}` calc-property bodies get
+        # compiled as standalone scriptblocks and logged).
+        "$_.Execute + ' ' + $_.Arguments",
+        "$_.Actions | ForEach-Object",
+        # PS_DEBUG / engine wrappers
+        "$ErrorActionPreference",
+    ]
+
+    # PowerShell profile paths — files that run on every PS launch.
+    # When a 4104 event's "Path:" field points at one of these, it's the
+    # OS compiling the user's profile on session start. The profile content
+    # is the same data the --persistence scanner enumerates. Tagging the
+    # 4104 as PS_PROFILE_LOAD lets the analyst see at-a-glance "this is the
+    # profile compiling, not arbitrary PowerShell activity".
+    PS_PROFILE_PATH_FRAGMENTS = (
+        # Windows PowerShell 5.1
+        r"\WindowsPowerShell\profile.ps1",
+        r"\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
+        # PowerShell 7+
+        r"\PowerShell\profile.ps1",
+        r"\PowerShell\Microsoft.PowerShell_profile.ps1",
+        # All-users variants
+        r"\System32\WindowsPowerShell\v1.0\profile.ps1",
+        r"\System32\WindowsPowerShell\v1.0\Microsoft.PowerShell_profile.ps1",
+    )
+
+    # Well-known machine / service SIDs that ALWAYS get the full SYSTEM
+    # privilege set. 4672 firing for these is routine OS behavior (Service
+    # Control Manager starting a service); flagging it MED on every service
+    # start drowned out real signal. SIDs from MS-DTYP appendix:
+    SYSTEM_SIDS = frozenset({
+        "S-1-5-18",   # NT AUTHORITY\SYSTEM (LocalSystem)
+        "S-1-5-19",   # NT AUTHORITY\LOCAL SERVICE
+        "S-1-5-20",   # NT AUTHORITY\NETWORK SERVICE
+    })
+
+    @classmethod
+    def classify_security_event(cls, eid, msg):
+        """Smarter classification for the Security log's high-volume events
+        4624 (logon-success) and 4672 (special-privileges-assigned).
+
+        Both fire as a pair every time Service Control Manager starts a
+        service running under SYSTEM/LocalService/NetworkService — that's
+        ~10-50 times per minute on a typical desktop and is pure noise.
+        A real privilege-escalation signal is 4672 firing for a NON-system
+        SID, or 4624 with Logon Type != 5 on an admin account.
+
+        Returns (severity, kind_suffix) or None to fall back to the table
+        default.
+        """
+        if not msg:
+            return None
+        # Match the FIRST Security ID line — that's the Subject (who's
+        # logging on / receiving privileges), not the New Logon block.
+        m = re.search(r"Security ID:\s*(S-\d-\d+(?:-\d+)*)", msg)
+        subject_sid = m.group(1) if m else ""
+        # Logon Type is only meaningful for 4624; 4672 doesn't carry it.
+        lt_match = re.search(r"Logon Type:\s*(\d+)", msg)
+        logon_type = int(lt_match.group(1)) if lt_match else None
+
+        # --- 4672: privilege assignment ---
+        if eid == 4672:
+            if subject_sid in cls.SYSTEM_SIDS:
+                # Service-account logon. Routine; downgrade to LOW so it's
+                # available for context but not alarming.
+                return ("LOW", "SPECIAL_PRIV_SYSTEM")
+            return ("MED", "SPECIAL_PRIV")
+
+        # --- 4624: logon success ---
+        if eid == 4624:
+            if logon_type == 5:
+                # Service Control Manager starting a service — routine.
+                return ("LOW", "LOGON_SUCCESS_SERVICE")
+            if logon_type == 4:
+                # Batch (scheduled task) — usually routine.
+                return ("LOW", "LOGON_SUCCESS_BATCH")
+            if logon_type == 7:
+                # Workstation unlock (lock screen → password) — routine.
+                return ("LOW", "LOGON_SUCCESS_UNLOCK")
+            if logon_type == 10:
+                # Remote Interactive (RDP) — MED on a desktop.
+                return ("MED", "LOGON_SUCCESS_RDP")
+            if logon_type == 3:
+                # Network (SMB, IIS auth, etc.).
+                if subject_sid in cls.SYSTEM_SIDS:
+                    return ("LOW", "LOGON_SUCCESS_NET_SYSTEM")
+                return ("MED", "LOGON_SUCCESS_NET")
+            if logon_type == 2:
+                # Interactive console login.
+                return ("LOW", "LOGON_SUCCESS_INTERACTIVE")
+            return None
+
+        return None
+
+    @classmethod
+    def _classify_ps_scriptblock(cls, msg):
+        """Return (severity, kind_suffix). Severity 'SELF' marks events
+        generated by netmon's own PowerShell invocations — they're kept
+        in the entry list but tagged so the HTML report can hide them
+        behind a 'Show events generated by netmon.py' toggle (analyst
+        gets visibility on demand without the noise by default).
+
+        Earlier v1.3 dev returned (None, None) for these and the caller
+        dropped them entirely; that broke audit completeness — operators
+        had no way to see what netmon itself contributed to the logs.
+        """
+        if not msg:
+            return ("LOW", "PS_SCRIPT_BLOCK")
+        # netmon-self events: kept but tagged, hidden by default in HTML.
+        for needle in cls.PS_NETMON_SELF_PATTERNS:
+            if needle in msg:
+                return ("SELF", "PS_NETMON_SELF")
+        # Promote to HIGH on offensive tradecraft (regardless of source —
+        # malicious code in a profile DOES still get flagged HIGH).
+        for needle, kind in cls.PS_OFFENSIVE_PATTERNS:
+            if needle.lower() in msg.lower():
+                return ("HIGH", kind)
+        # Profile compile: same content every PS launch, low signal value.
+        # Tagged so analysts know what they're looking at.
+        for frag in cls.PS_PROFILE_PATH_FRAGMENTS:
+            if frag in msg:
+                return ("LOW", "PS_PROFILE_LOAD")
+        # Everything else stays LOW — informational only.
+        return ("LOW", "PS_SCRIPT_BLOCK")
+
+    def _read_windows(self):
+        """Read the four Windows log sources in PARALLEL so one slow log
+        (typically Security on a busy desktop) doesn't starve the others
+        of the shared time budget. Per-source access failures (typically
+        Security log requiring admin) are recorded in self.sources_skipped
+        so the operator can see why a source contributed zero entries."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        items = list(self.WIN_EVENT_IDS.items())
+        per_call_timeout = max(5, min(15, int(self.MAX_TIME_SECONDS)))
+        results = []
+        with ThreadPoolExecutor(max_workers=len(items)) as ex:
+            futures = {ex.submit(self._collect_windows_log, log_name, ids,
+                                 per_call_timeout): log_name
+                       for log_name, ids in items}
+            for fut in as_completed(futures, timeout=self.MAX_TIME_SECONDS + 5):
+                try:
+                    results.append(fut.result(timeout=1))
+                except (OSError, subprocess.SubprocessError, ValueError,
+                        json.JSONDecodeError, RuntimeError, TimeoutError) as e:
+                    log.debug("windows log read future failed: %s", e)
+        # Merge results from all sources into self.entries.
+        for log_name, entries, skip_reason in results:
+            for ts_unix, sev, kind, user, src_ip, msg in entries:
+                self._add(log_name.replace("Microsoft-Windows-", ""),
+                          ts_unix, sev, kind, user, src_ip, msg)
+            if entries:
+                self.sources_read.append((log_name, log_name))
+            if skip_reason:
+                self.sources_skipped.append((log_name, skip_reason))
+
+    def _collect_windows_log(self, log_name, ids, timeout):
+        """PowerShell-side read for a single log. Returns a tuple of
+        (log_name, [entries], skip_reason). skip_reason is a short string
+        when the log was unreadable, else None. No instance state mutated
+        here — safe to call concurrently."""
+        start = datetime.fromtimestamp(self.cutoff).strftime("%Y-%m-%dT%H:%M:%S")
+        ids_csv = ",".join(str(i) for i in ids)
+        per_source_cap = min(self.MAX_ENTRIES_PER_SOURCE, 2000)
+        # Use a verbose error stream — we WANT the UnauthorizedAccessException
+        # text on stderr so we can surface "needs admin" to the operator.
+        ps = (
+            f"$ErrorActionPreference='Continue';"
+            f"Get-WinEvent -FilterHashtable @{{LogName='{log_name}';"
+            f"StartTime=[datetime]'{start}';Id=@({ids_csv})}} -MaxEvents {per_source_cap} | "
+            f"Select-Object @{{N='ts';E={{$_.TimeCreated.ToUniversalTime().ToString('o')}}}},"
+            f"Id, LevelDisplayName, "
+            f"@{{N='User';E={{if($_.UserId){{$_.UserId.Value}}else{{''}}}}}}, "
+            f"@{{N='Message';E={{if($_.Message){{$_.Message.Substring(0,[Math]::Min($_.Message.Length,4000))}}else{{''}}}}}} | "
+            f"ConvertTo-Json -Compress -Depth 3"
+        )
+        out = []
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("windows log read for %s failed: %s", log_name, e)
+            return (log_name, out, f"subprocess error: {e}")
+        stderr = (r.stderr or "")
+        # Classify common failure modes so the operator sees actionable info.
+        skip_reason = None
+        if "UnauthorizedAccessException" in stderr or "Access is denied" in stderr:
+            skip_reason = "access denied (run elevated for full coverage)"
+        elif "No events were found" in stderr:
+            skip_reason = "no matching events in window"
+        elif "There is not an event log" in stderr or "Could not retrieve" in stderr:
+            skip_reason = "log not present on this host"
+        if not (r.stdout or "").strip():
+            return (log_name, out, skip_reason)
+        try:
+            data = json.loads(r.stdout)
+        except (ValueError, json.JSONDecodeError):
+            return (log_name, out, skip_reason or "unparseable JSON output")
+        if isinstance(data, dict):
+            data = [data]
+        for ev in data:
+            try:
+                ts = ev.get("ts", "")
+                if not ts:
+                    continue
+                ts_unix = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                continue
+            eid = ev.get("Id", 0)
+            sev, kind = ids.get(eid, ("LOW", str(eid)))
+            msg = ev.get("Message", "") or ""
+            user = ev.get("User", "") or ""
+            src_ip = ""
+            m = re.search(r"Source Network Address:\s*(\S+)", msg)
+            if m:
+                src_ip = m.group(1)
+            # Apply the noise / promotion classifier to BOTH 4103 (PS_MODULE)
+            # and 4104 (PS_SCRIPT_BLOCK). 4103 events carry the "Host
+            # Application" line (which contains netmon's `powershell …
+            # -Command Get-CimInstance …` invocation), so the same self-noise
+            # filter catches them. Without this, every netmon call to
+            # PersistenceScanner / Get-WinEvent / etc. produced ~14 LOW
+            # log entries on Windows hosts.
+            #
+            # v1.3 UX (this turn): netmon-self events are KEPT (not dropped)
+            # with severity 'SELF'. The HTML hides them by default and
+            # surfaces a 'Show events generated by netmon.py (N hidden)'
+            # toggle so analysts can audit netmon's own runtime footprint
+            # on demand. Severity 'SELF' is filtered out of HIGH/MED/LOW
+            # counts.
+            if eid in (4103, 4104):
+                ps_sev, ps_kind = self._classify_ps_scriptblock(msg)
+                if eid == 4104:
+                    sev, kind = ps_sev, ps_kind
+                # For 4103 the classifier promotes severity if real malicious
+                # patterns appear in the host-application line; SELF still
+                # propagates so the toggle works for 4103 too.
+                elif ps_sev == "HIGH":
+                    sev = "HIGH"
+                    kind = ps_kind
+                elif ps_sev == "SELF":
+                    sev = "SELF"
+                    kind = ps_kind
+            # v1.3: SID + Logon-Type aware Security-event classifier so
+            # SCM service starts (4624 Type 5 + 4672 for SYSTEM SID) stop
+            # generating MED-noise on every service launch.
+            if eid in (4624, 4672):
+                sec = self.classify_security_event(eid, msg)
+                if sec is not None:
+                    sev, kind = sec
+            out.append((ts_unix, sev, f"EID_{eid}_{kind}", user, src_ip, msg))
+        return (log_name, out, None if out else skip_reason)
+
+    # --- macOS ---
+    def _read_macos(self):
+        # macOS uses `log show` for the unified log. It's heavy; just collect
+        # the auth/sudo events for the window.
+        if not shutil.which("log"):
+            return
+        try:
+            r = subprocess.run(
+                ["log", "show", "--last", f"{self.minutes}m",
+                 "--predicate", "process == 'sudo' OR process == 'sshd' OR eventMessage CONTAINS 'authentication'",
+                 "--style", "compact", "--info"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            for line in (r.stdout or "").splitlines()[: self.MAX_ENTRIES_PER_SOURCE]:
+                # macOS compact: "2025-12-31 14:23:45.123456+0000  I  sudo[123]:  message"
+                m = re.match(r"(\S+\s\S+)\s+\S+\s+(\S+):\s+(.*)", line)
+                if not m:
+                    continue
+                try:
+                    ts_clean = m.group(1).split(".")[0]
+                    ts_unix = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S").timestamp()
+                except (ValueError, TypeError):
+                    continue
+                prog = m.group(2)
+                msg = m.group(3)
+                self._add("macos_log", ts_unix, "LOW", prog, "", "", msg)
+            self.sources_read.append(("macos_log", "log show"))
+        except (OSError, subprocess.SubprocessError):
+            return
+
+
+def correlate_log_findings(entries):
+    """Apply cross-event correlation rules. Returns a list of derived
+    finding dicts (same shape as LogReader entries) representing higher-
+    level signals like brute-force-then-success."""
+    derived = []
+    # Bucket by (src_ip, user) for SSH brute-force-then-success.
+    ssh_fails = defaultdict(list)
+    ssh_oks = []
+    for e in entries:
+        if e["event_id"] == "SSH_FAILED" and e["src_ip"]:
+            ssh_fails[(e["src_ip"], e["user"])].append(e["timestamp_unix"])
+        elif e["event_id"] == "SSH_ACCEPTED" and e["src_ip"]:
+            ssh_oks.append((e["src_ip"], e["user"], e["timestamp_unix"]))
+    for src_ip, user, ok_ts in ssh_oks:
+        fails = ssh_fails.get((src_ip, user), [])
+        nearby = [t for t in fails if 0 < ok_ts - t < 300]   # 5-min window
+        if len(nearby) >= 10:
+            derived.append({
+                "timestamp_unix": ok_ts,
+                "timestamp": datetime.fromtimestamp(ok_ts).strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "correlation",
+                "severity": "HIGH",
+                "event_id": "BRUTE_FORCE_THEN_SUCCESS",
+                "user": user, "src_ip": src_ip,
+                "message": f"sshd: {len(nearby)} failed attempts then SUCCESS for {user}@{src_ip}",
+            })
+    return derived
+
+
+# === v1.3: SCTP / Unix-socket / non-TCP transport enumeration (F-1.x) =======
+
+def enumerate_sctp():
+    """Read /proc/net/sctp/{eps,assocs} for SCTP endpoints + associations.
+
+    Returns list of (transport='sctp', local, remote, status, kind).
+    Linux-only; empty list elsewhere.
+    """
+    out = []
+    if not sys.platform.startswith("linux"):
+        return out
+    # /proc/net/sctp/eps: ENDPT SOCK STY SST HBKT LPORT uid inode LADDRS
+    try:
+        with open("/proc/net/sctp/eps") as f:
+            header = f.readline()
+            if "LPORT" not in header:
+                return out
+            for line in f:
+                parts = line.split()
+                if len(parts) < 9:
+                    continue
+                try:
+                    lport = int(parts[5])
+                except (ValueError, IndexError):
+                    continue
+                laddrs = " ".join(parts[8:])
+                # Take just the first address for display
+                first = laddrs.split()[0] if laddrs.split() else "0.0.0.0"
+                local = f"{first}:{lport}"
+                out.append({
+                    "transport": "sctp", "local": local, "remote": "",
+                    "status": "LISTEN", "kind": "endpoint",
+                })
+    except OSError:
+        pass
+    # /proc/net/sctp/assocs: many fields; format is well-known but order can differ
+    try:
+        with open("/proc/net/sctp/assocs") as f:
+            header = f.readline()
+            if "LPORT" not in header:
+                return out
+            cols = header.split()
+            try:
+                idx_lport = cols.index("LPORT")
+                idx_rport = cols.index("RPORT")
+                idx_laddr = cols.index("LADDRS")
+                idx_raddr = cols.index("RADDRS") if "RADDRS" in cols else None
+            except ValueError:
+                return out
+            for line in f:
+                parts = line.split()
+                if len(parts) <= idx_lport:
+                    continue
+                try:
+                    lport = int(parts[idx_lport])
+                    rport = int(parts[idx_rport])
+                except (ValueError, IndexError):
+                    continue
+                laddr = parts[idx_laddr] if idx_laddr < len(parts) else "0.0.0.0"
+                raddr = parts[idx_raddr] if (idx_raddr is not None and idx_raddr < len(parts)) else "0.0.0.0"
+                out.append({
+                    "transport": "sctp",
+                    "local":  f"{laddr}:{lport}",
+                    "remote": f"{raddr}:{rport}",
+                    "status": "ESTABLISHED", "kind": "assoc",
+                })
+    except OSError:
+        pass
+    return out
+
+
+def enumerate_unix_sockets():
+    """List AF_UNIX sockets via psutil. Returns list of dicts with the same
+    shape as TCP/UDP rows; transport='unix'. Per-socket peer info varies by
+    platform and is often unavailable for stream sockets."""
+    out = []
+    # AF_UNIX only exists on POSIX. psutil rejects kind="unix" on Windows.
+    if sys.platform == "win32":
+        return out
+    try:
+        conns = psutil.net_connections(kind="unix")
+    except (psutil.AccessDenied, AttributeError, ValueError):
+        return out
+    for c in conns:
+        path = getattr(c.laddr, "path", "") or ""
+        if not path:
+            continue
+        out.append({
+            "transport": "unix",
+            "local": path,
+            "remote": "",
+            "status": c.status or "NONE",
+            "pid": c.pid,
+            "kind": "stream",
+        })
+    return out
+
+
+# === v1.3: DoH endpoint detection (F-1.5) ===================================
+
+# Public DoH endpoints we recognize. Used to flag connections that talk DNS
+# over HTTPS, which is suspicious unless the calling process is a browser.
+DOH_HOSTS = frozenset({
+    "1.1.1.1", "1.0.0.1",
+    "8.8.8.8", "8.8.4.4",
+    "9.9.9.9", "149.112.112.112",
+    "dns.google", "dns.google.com",
+    "cloudflare-dns.com", "mozilla.cloudflare-dns.com",
+    "doh.opendns.com", "doh.cleanbrowsing.org",
+    "dns.quad9.net", "doh.familyshield.opendns.com",
+})
+
+BROWSER_PROCESSES = frozenset({
+    "firefox", "firefox.exe", "firefox-bin",
+    "chrome", "chrome.exe", "google-chrome", "google-chrome-stable",
+    "msedge", "msedge.exe", "microsoft-edge",
+    "safari", "brave", "brave.exe", "opera", "opera.exe",
+    "vivaldi", "vivaldi.exe",
+})
+
+
+def looks_like_doh(remote_ip, remote_port, hostname):
+    """Return True if a connection looks like DNS-over-HTTPS."""
+    if remote_port != 443:
+        return False
+    if remote_ip in DOH_HOSTS:
+        return True
+    if hostname:
+        host_lower = hostname.lower()
+        if any(host_lower == h or host_lower.endswith("." + h) for h in DOH_HOSTS):
+            return True
+    return False
+
+
+def is_browser_process(app_name):
+    if not app_name:
+        return False
+    return _normalize_app_name(app_name) in BROWSER_PROCESSES
+
+
+# === v1.3: JA3 TLS fingerprinting (F-1.6) ===================================
+
+# JA3 string = SSLVersion,Cipher,Extension,EllipticCurve,EllipticCurvePointFormat
+# Reference: https://github.com/salesforce/ja3
+# MD5 of that string is the JA3 hash. Small bundled list of known C2 JA3
+# hashes — operators can swap in a richer feed via --ja3-feed.
+KNOWN_BAD_JA3 = {
+    # Cobalt Strike default profile (Java HTTPSURLConnection) — multiple known
+    "72a589da586844d7f0818ce684948eea": "Cobalt Strike Java client",
+    "a0e9f5d64349fb13191bc781f81f42e1": "Cobalt Strike (legacy)",
+    "06c2c1c3c5d17cf26b8e58b67c1a8b8a": "Sliver beacon (default)",
+    "e7d705a3286e19ea42f587b344ee6865": "Metasploit Meterpreter (Windows)",
+    "51c64c77e60f3980eea90869b68c58a8": "Empire 3.x default",
+}
+
+
+def compute_ja3(client_hello_body):
+    """Compute the JA3 hash given the TLS Client Hello body (without the
+    record / handshake headers — starts at the ClientHello version field).
+
+    Returns (ja3_string, ja3_hash) or (None, None) on parse failure.
+    """
+    try:
+        buf = client_hello_body
+        if len(buf) < 38:
+            return None, None
+        # ClientHello layout:
+        # 2  version
+        # 32 random
+        # 1  session_id_length
+        # session_id_length bytes session_id
+        # 2  cipher_suites_length
+        # cipher_suites_length bytes cipher_suites
+        # 1  compression_methods_length
+        # n  compression_methods
+        # 2  extensions_length
+        # extensions
+        version = struct.unpack(">H", buf[0:2])[0]
+        idx = 2 + 32
+        sid_len = buf[idx]
+        idx += 1 + sid_len
+        if idx + 2 > len(buf):
+            return None, None
+        cs_len = struct.unpack(">H", buf[idx:idx+2])[0]
+        idx += 2
+        if idx + cs_len > len(buf):
+            return None, None
+        cipher_bytes = buf[idx:idx+cs_len]
+        ciphers = [struct.unpack(">H", cipher_bytes[i:i+2])[0]
+                   for i in range(0, cs_len, 2)]
+        idx += cs_len
+        if idx >= len(buf):
+            return None, None
+        cm_len = buf[idx]
+        idx += 1 + cm_len
+        if idx + 2 > len(buf):
+            return None, None
+        ext_total = struct.unpack(">H", buf[idx:idx+2])[0]
+        idx += 2
+        ext_end = idx + ext_total
+        if ext_end > len(buf):
+            return None, None
+        extensions = []
+        curves = []
+        ec_formats = []
+        # GREASE values to filter out per the JA3 spec
+        GREASE = {0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
+                  0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA}
+        while idx + 4 <= ext_end:
+            etype = struct.unpack(">H", buf[idx:idx+2])[0]
+            elen = struct.unpack(">H", buf[idx+2:idx+4])[0]
+            idx += 4
+            ebody = buf[idx:idx+elen]
+            idx += elen
+            if etype in GREASE:
+                continue
+            extensions.append(etype)
+            if etype == 0x000a and len(ebody) >= 2:   # supported_groups (curves)
+                clen = struct.unpack(">H", ebody[0:2])[0]
+                curves_bytes = ebody[2:2+clen]
+                for i in range(0, len(curves_bytes), 2):
+                    if i + 2 <= len(curves_bytes):
+                        cv = struct.unpack(">H", curves_bytes[i:i+2])[0]
+                        if cv not in GREASE:
+                            curves.append(cv)
+            elif etype == 0x000b and len(ebody) >= 1:  # ec_point_formats
+                fmt_len = ebody[0]
+                for b in ebody[1:1+fmt_len]:
+                    ec_formats.append(b)
+        ciphers_str = "-".join(str(c) for c in ciphers if c not in GREASE)
+        ext_str = "-".join(str(e) for e in extensions)
+        curves_str = "-".join(str(c) for c in curves)
+        ec_fmt_str = "-".join(str(f) for f in ec_formats)
+        ja3 = f"{version},{ciphers_str},{ext_str},{curves_str},{ec_fmt_str}"
+        # Bandit B324 false positive — MD5 here is the JA3 spec, NOT crypto.
+        ja3_hash = hashlib.md5(ja3.encode("ascii")).hexdigest()  # nosec B324 - JA3 spec
+        return ja3, ja3_hash
+    except (struct.error, IndexError, ValueError):
+        return None, None
+
+
+# === v1.3: ICMP-tunnel heuristic (F-1.3) ====================================
+# Threshold: ≥50 echo packets to one peer AND avg payload > 1000 bytes.
+ICMP_TUNNEL_MIN_PACKETS = 50
+ICMP_TUNNEL_MIN_AVG_PAYLOAD = 1000
+
+
+# === v1.3: Diff mode (F-6.3) ================================================
+
+def load_run_json(path):
+    """Load a previous run's JSON output (--json). Returns the parsed dict."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compute_diff(old, new):
+    """Compute the diff between two run dicts. Returns a dict with keys:
+       new_flows / gone_flows / risk_transitions, each a list."""
+    def _key(r):
+        return (r.get("app"), r.get("pid"), r.get("local"), r.get("remote"))
+    old_by_key = {_key(r): r for r in old.get("connections", [])}
+    new_by_key = {_key(r): r for r in new.get("connections", [])}
+    new_flows = [new_by_key[k] for k in new_by_key.keys() - old_by_key.keys()]
+    gone_flows = [old_by_key[k] for k in old_by_key.keys() - new_by_key.keys()]
+    transitions = []
+    for k in new_by_key.keys() & old_by_key.keys():
+        old_r = old_by_key[k]; new_r = new_by_key[k]
+        if old_r.get("risk") != new_r.get("risk"):
+            transitions.append({"key": list(k),
+                                "from": old_r.get("risk"),
+                                "to":   new_r.get("risk"),
+                                "row":  new_r})
+    return {
+        "new_flows": new_flows,
+        "gone_flows": gone_flows,
+        "risk_transitions": transitions,
+    }
+
+
+# === v1.3: Webhook alerting (F-9.1) =========================================
+
+def send_webhook_alerts(webhook_url, conn_history, log_findings=None,
+                       persistence=None, webshell=None, console=None):
+    """POST a JSON payload of HIGH findings to a webhook. Caller passes URL.
+    Errors are logged but never raised — alerting failure must not break
+    the report run.
+
+    INTERNAL / UNDOCUMENTED: the --alert-webhook CLI flag that drives this
+    is hidden from --help on purpose (argparse.SUPPRESS). Reasoning:
+        - it ships findings off-host to a third-party URL,
+        - a stale $NETMON_WEBHOOK env var would leak data to the wrong sink,
+        - operators who actually want this kept it discoverable via source.
+    If you're reading this and want to enable: set $NETMON_WEBHOOK or pass
+    --alert-webhook URL explicitly. Slack / Teams / Discord incoming
+    webhooks all accept the payload shape below (rendering will be raw JSON;
+    map through a relay if you want formatting). No custom headers / HMAC
+    signing in v1.3 — treat the URL as a shared secret accordingly.
+    """
+    if not webhook_url:
+        return
+    high_rows = [c for c in conn_history.values()
+                 if c.get("risk") == "HIGH"]
+    high_logs = [e for e in (log_findings or [])
+                 if e.get("severity") == "HIGH"]
+    high_persist = [p for p in (persistence or [])
+                    if p.get("recent")]
+    if not (high_rows or high_logs or high_persist or webshell):
+        return
+    payload = {
+        "tool":    f"netmon.py/{VERSION}",
+        "host":    socket.gethostname(),
+        "ts":      datetime.now().isoformat(),
+        "high_conn_count": len(high_rows),
+        "high_log_count":  len(high_logs),
+        "recent_persistence": len(high_persist),
+        "webshell_findings": len(webshell or []),
+        "summary": _summarize_for_webhook(high_rows, high_logs, webshell or []),
+    }
+    try:
+        requests.post(webhook_url, json=payload, timeout=HTTP_TIMEOUT)
+        if console:
+            console.print(f"[green]Webhook alert sent:[/green] {webhook_url}")
+    except requests.RequestException as e:
+        log.warning("webhook alert failed: %s", e)
+        if console:
+            console.print(f"[yellow]Webhook alert failed:[/yellow] {e}")
+
+
+def _summarize_for_webhook(rows, logs, webshell):
+    """Build a small human-readable summary for the webhook body."""
+    lines = []
+    for c in rows[:20]:
+        lines.append(f"  HIGH conn: {c.get('app')} {c.get('local')} → "
+                     f"{c.get('remote')} [{', '.join(c.get('flags') or [])}]")
+    for e in logs[:20]:
+        lines.append(f"  HIGH log:  {e.get('source')} {e.get('event_id')} — {e.get('message','')[:120]}")
+    for w in webshell[:20]:
+        lines.append(f"  WEBSHELL:  {w.get('path')} [{', '.join(w.get('flags') or [])}]")
+    return "\n".join(lines)
 
 
 def classify_local_ip(ip):
@@ -1423,20 +3971,51 @@ class SecurityMonitor:
         # First-seen timestamp per unique (pid, local_addr, remote_addr).
         # A "beacon" = many distinct local-port attempts to the same remote at regular intervals.
         self.first_seen = {}
+        # Map (pid, local, remote) -> wall-clock start time for the session age column.
+        self.session_start = {}
         self.ip_cache = {}
         self.file_hash_cache = {}
         self.headers = {"User-Agent": f"netmon.py/{VERSION}"}
-        self.signing = SignatureChecker(enabled=not args.no_signing)
+        # Code-signing/trust checker. On Windows: Authenticode. On Linux:
+        # owning-package via dpkg/rpm/pacman/apk. On macOS: codesign.
+        no_signing = getattr(args, "no_signing", False)
+        if sys.platform == "win32":
+            self.signing = SignatureChecker(enabled=not no_signing)
+        elif sys.platform.startswith("linux"):
+            self.signing = LinuxPackageChecker(enabled=not no_signing)
+        elif sys.platform == "darwin":
+            self.signing = MacOSSignatureChecker(enabled=not no_signing)
+        else:
+            self.signing = SignatureChecker(enabled=False)
         self.threat = ThreatIntel(
             offline=args.offline,
             scan_tor=getattr(args, "scan_tor", False),
             console=console,
         )
         self.vt = VirusTotalClient(args.vt_api_key, console=console) if args.vt_api_key else None
+        # CrowdSec — only meaningful on Linux hosts that run CrowdSec.
+        if (sys.platform.startswith("linux")
+                and not getattr(args, "no_crowdsec", False)
+                and not args.offline):
+            self.crowdsec = CrowdSecClient(
+                token=getattr(args, "crowdsec_token", None),
+                console=console,
+            )
+        else:
+            self.crowdsec = None
+        # Firewall state snapshot. Cheap one-shot probe at startup; subsequent
+        # rows reuse the cached verdict.
+        self.firewall = FirewallState() if not getattr(args, "no_firewall", False) else None
         self.flow = None
         self.capture = None
         self.dns_findings = []
         self.saved_pcap_path = None
+        # v1.3 finding collections — populated during monitor()
+        self.log_findings = []         # F-3
+        self.log_sources_skipped = []  # F-3 — list of (source, reason) tuples
+        self.persistence_findings = []  # F-4
+        self.webshell_findings = []     # F-2.3
+        self.diff_result = None         # F-6.3
 
     # --- file hashing ---
     def get_file_hash(self, path):
@@ -1608,10 +4187,27 @@ class SecurityMonitor:
             score += 3
             flags.append("TOR_EXIT")
 
+        # 4b. CrowdSec verdict on the remote IP (T2-1)
+        cs_verdict = conn.get("crowdsec")
+        if cs_verdict == "ban":
+            score += 3
+            flags.append("CROWDSEC_BANNED")
+        elif cs_verdict in ("captcha", "throttle"):
+            score += 1
+            flags.append(f"CROWDSEC_{cs_verdict.upper()}")
+
         # 5. Soft path + unsigned binary = MED bump
         sig = conn.get("signature") or {}
         is_signed_trusted = sig.get("trusted", False)
         is_signed = sig.get("signed", False)
+        is_tampered = sig.get("tampered", False)
+
+        # 5b. PACKAGE_TAMPERED (T1-1) — Linux package-manager integrity check
+        # failed for this binary. Modified system binaries are a major IoC,
+        # so this is HIGH-risk on its own.
+        if is_tampered:
+            score += 5
+            flags.append("PACKAGE_TAMPERED")
 
         soft_path_hit = any(frag in path_lower for frag in (s.lower() for s in SOFT_SUSPICIOUS_PATH_FRAGMENTS))
         if soft_path_hit:
@@ -1624,25 +4220,140 @@ class SecurityMonitor:
                 score += 2
                 flags.append("UNSIGNED_USER_PATH")
 
-        # 6. Unsigned binary with network activity. Score bumped from +1 to +2
-        # because an unsigned executable making outbound network calls is a
-        # primary C2 indicator. v1.1 under-weighted this and missed real C2.
-        if conn["path"] and conn["path"] not in ("N/A", "Access Denied") and ip and not is_signed:
+        # === Direction-aware C2 detection (T1-2) ===
+        # Pre-computed by the monitor — 'INBOUND' / 'OUTBOUND' / 'LOOPBACK' /
+        # 'LISTEN' / 'AMBIGUOUS'. INBOUND means we're the server side of the
+        # socket, so UNSIGNED_OUTBOUND_C2 must NOT fire (an inbound SSH from
+        # a random WAN IP is exactly what sshd is supposed to accept).
+        direction = conn.get("direction") or classify_direction(
+            conn.get("local"), conn.get("remote"), conn.get("status")
+        ) or "AMBIGUOUS"
+        status = (conn.get("status") or "").upper()
+
+        # 6. Unsigned binary with network activity. Skip if this is a known
+        # server-role binary on its expected port handling an inbound
+        # connection — that's the daemon doing its job.
+        is_known_server = (server_expected_port(conn.get("app"), self._local_port(conn["local"]))
+                           or server_expected_port(conn.get("app"), port))
+        suppress_unsigned = (
+            is_known_server
+            and direction in ("INBOUND", "LISTEN")
+            and not is_tampered
+        )
+
+        if (conn["path"] and conn["path"] not in ("N/A", "Access Denied")
+                and ip and not is_signed and not suppress_unsigned):
             score += 2
             flags.append("UNSIGNED_BINARY")
 
-        # 6b. UNSIGNED_OUTBOUND_C2: unsigned binary + ESTABLISHED connection +
-        # public destination IP. This is the textbook C2 fingerprint and
-        # should reach HIGH on its own. Combined with UNSIGNED_BINARY (+2)
-        # the score lands at HIGH (≥5) without requiring suspicious-path /
-        # suspicious-port / Tor-exit signals to also fire.
-        status = (conn.get("status") or "").upper()
+        # 6b. UNSIGNED_OUTBOUND_C2: fires for OUTBOUND or AMBIGUOUS direction.
+        # An inbound SSH session from a public IP (direction=INBOUND) is NOT
+        # C2 — but AMBIGUOUS (both sides in the user-port range) defaults to
+        # the v1.2 behavior so client traffic with a low local ephemeral port
+        # (e.g. Win 7-style 1024+ range) still gets flagged.
         if (conn["path"] and conn["path"] not in ("N/A", "Access Denied")
                 and ip and not is_signed
                 and status == "ESTABLISHED"
-                and classify_local_ip(ip) is None):
+                and classify_local_ip(ip) is None
+                and direction in ("OUTBOUND", "AMBIGUOUS")
+                and not suppress_unsigned):
             score += 3
             flags.append("UNSIGNED_OUTBOUND_C2")
+
+        # 6c. INBOUND_SESSION informational flag (no risk bump). Surfaces the
+        # inbound flow in the UI so operators can spot unexpected listeners.
+        if direction == "INBOUND" and status == "ESTABLISHED":
+            flags.append("INBOUND_SESSION")
+            # 6d. INBOUND_FROM_TOR — real signal: an exposed service taking
+            # connections from Tor exits is almost always abusive scanning.
+            if ip and self.threat.is_tor_exit(ip):
+                score += 3
+                flags.append("INBOUND_FROM_TOR")
+
+        # 6e. REVERSE_SHELL_LIKELY (T2-4): a server-role process (sshd,
+        # apache2, …) making an OUTBOUND connection to a public IP. Server
+        # daemons accept inbound, they don't dial out — this is the textbook
+        # reverse-shell fingerprint regardless of whether the binary is
+        # signed / packaged.
+        if (is_server_binary(conn.get("app"))
+                and direction == "OUTBOUND"
+                and status == "ESTABLISHED"
+                and ip and classify_local_ip(ip) is None):
+            score += 5
+            flags.append("REVERSE_SHELL_LIKELY")
+
+        # 6f. IMPOSTOR_LISTEN_PORT: a known server binary bound to a port that
+        # is NOT in its expected port set. e.g. sshd listening on :8888.
+        if direction == "LISTEN" and is_server_binary(conn.get("app")):
+            lport = self._local_port(conn["local"])
+            if lport and not server_expected_port(conn.get("app"), lport):
+                score += 2
+                flags.append("IMPOSTOR_LISTEN_PORT")
+
+        # === v1.3 — additional detection content ===
+
+        # F-5.1: Suspicious command-line patterns.
+        cmdline = conn.get("cmdline") or ""
+        if cmdline:
+            sev, cmd_flags = analyze_cmdline(cmdline)
+            if cmd_flags:
+                for f in cmd_flags:
+                    if f not in flags:
+                        flags.append(f)
+                if sev == "HIGH":
+                    score += 5
+                elif sev == "MED":
+                    score += 2
+
+        # F-2.1: Web-shell spawn — web-server process has a blocklisted child.
+        # Implemented as: this row IS the blocklisted child AND its parent is
+        # a web server. (Detecting both halves of the relationship.)
+        if (is_blocklisted_child(conn.get("app"))
+                and is_web_server_process(conn.get("parent_app"))):
+            score += 5
+            flags.append("WEB_SHELL_SPAWN")
+
+        # F-2.5: Web-runtime user making outbound to public — extremely
+        # suspicious because legitimate web servers don't dial out.
+        if (is_web_user(conn.get("user"))
+                and direction == "OUTBOUND"
+                and ip and classify_local_ip(ip) is None
+                and status == "ESTABLISHED"):
+            score += 4
+            flags.append("WEBUSER_OUTBOUND")
+
+        # F-1.5: DoH from a non-browser process — likely covert C2.
+        if (status == "ESTABLISHED"
+                and looks_like_doh(ip, conn.get("remote_port"), conn.get("hostname"))
+                and not is_browser_process(conn.get("app"))):
+            score += 3
+            flags.append("DOH_FROM_NON_BROWSER")
+
+        # F-1.1: SCTP to a public IP — almost never legitimate.
+        if (conn.get("transport") == "sctp"
+                and ip and classify_local_ip(ip) is None):
+            score += 2
+            flags.append("SCTP_UNUSUAL")
+
+        # F-1.2: Unix socket with non-root process attached to docker.sock —
+        # well-known container-escape pre-cursor.
+        if (conn.get("transport") == "unix"
+                and "docker.sock" in (conn.get("local") or "")
+                and conn.get("user") not in ("root", "N/A", "Access Denied", "")):
+            score += 4
+            flags.append("UNIX_SOCKET_DOCKER")
+
+        # F-1.6: Known-bad JA3 fingerprint.
+        ja3 = conn.get("ja3")
+        if ja3 and ja3 in KNOWN_BAD_JA3:
+            score += 5
+            flags.append(f"JA3_C2_{KNOWN_BAD_JA3[ja3][:24].replace(' ', '_')}")
+
+        # F-1.3: ICMP-tunnel — peer flagged by FlowAnalyzer's per-peer
+        # echo-packet / payload thresholds. Conn has the matching remote_ip.
+        if ip and conn.get("icmp_tunnel"):
+            score += 3
+            flags.append("ICMP_TUNNEL_LIKELY")
 
         # 7. VT malicious hits
         vt = conn.get("vt")
@@ -1688,6 +4399,17 @@ class SecurityMonitor:
         except (ValueError, IndexError):
             return None
 
+    @staticmethod
+    def _local_port(local):
+        if not local:
+            return None
+        try:
+            if local.startswith("["):
+                return int(local.split("]:", 1)[1])
+            return int(local.rsplit(":", 1)[-1])
+        except (ValueError, IndexError):
+            return None
+
     # --- beacon detection ---
     def detect_beacons(self):
         """Detect periodic outbound calls — same (pid, remote) opens multiple
@@ -1721,14 +4443,47 @@ class SecurityMonitor:
         return beacons
 
     # --- main loop ---
+    def _netmon_self_pids(self):
+        """Return the set of PIDs that belong to *this* netmon run: our own
+        PID plus any descendant processes spawned by us (pktmon / tcpdump /
+        PowerShell sig-verify children / etc.). Connections owned by these
+        PIDs are tagged is_netmon_self=True so the HTML report hides them by
+        default (an analyst's first view shouldn't be polluted by the
+        monitor's own footprint). Recomputed each enumeration so newly-
+        spawned children are caught."""
+        pids = {os.getpid()}
+        try:
+            me = psutil.Process(os.getpid())
+            for child in me.children(recursive=True):
+                pids.add(child.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+        return pids
+
     def get_connections(self):
         connections = []
+        self_pids = self._netmon_self_pids()
         for conn in psutil.net_connections(kind="inet"):
             try:
                 local_addr = self._fmt_addr(conn.laddr)
                 remote_addr = self._fmt_addr(conn.raddr)
                 pid = conn.pid
-                app_name, exe_path, username, file_hash = "Unknown", "N/A", "N/A", "N/A"
+                # v1.3: pid=0 means the kernel holds an orphaned 4-tuple after
+                # the original owner exited — almost always TIME_WAIT or
+                # CLOSE_WAIT residue. Label it explicitly so analysts (and
+                # any AV / IR / auditor reviewing the report) don't read
+                # "Unknown" as "unidentified suspicious process".
+                status_upper = (conn.status or "").upper()
+                if pid in (0, None) and status_upper in (
+                        "TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT1", "FIN_WAIT2",
+                        "LAST_ACK", "CLOSING"):
+                    default_app = "(closed/pid-0)"
+                else:
+                    default_app = "Unknown"
+                app_name, exe_path, username, file_hash = default_app, "N/A", "N/A", "N/A"
+                cmdline = ""
+                ppid = None
+                parent_app = ""
                 if pid:
                     try:
                         proc = psutil.Process(pid)
@@ -1736,6 +4491,19 @@ class SecurityMonitor:
                         exe_path = proc.exe()
                         username = proc.username()
                         file_hash = self.get_file_hash(exe_path)
+                        # v1.3 F-5.1 / F-6.2: cmdline + parent PID lineage
+                        try:
+                            cmdline_list = proc.cmdline()
+                            cmdline = " ".join(cmdline_list)[:4096]
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                            cmdline = ""
+                        try:
+                            ppid = proc.ppid()
+                            if ppid:
+                                parent_app = psutil.Process(ppid).name()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                            ppid = None
+                            parent_app = ""
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         app_name = "System/Protected"
                         exe_path = "Access Denied"
@@ -1745,6 +4513,11 @@ class SecurityMonitor:
                     "country": "N/A", "country_code": "", "org": "N/A", "hostname": "N/A",
                     "asn": None, "is_tor": False, "is_private": False,
                 }
+                # Pre-classify direction (T1-2) and resolve systemd unit (T2-2).
+                direction = classify_direction(local_addr, remote_addr, conn.status)
+                systemd_unit = systemd_unit_for_pid(pid) if pid else None
+                # v1.3: tag transport for the unified table (TCP vs UDP).
+                transport = "tcp" if conn.type == socket.SOCK_STREAM else "udp"
                 conn_data = {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "pid": pid,
@@ -1757,6 +4530,16 @@ class SecurityMonitor:
                     "remote_ip": ip,
                     "remote_port": self._remote_port(remote_addr),
                     "status": conn.status,
+                    "direction": direction,
+                    "transport": transport,           # v1.3 — tcp/udp/sctp/unix
+                    "cmdline": cmdline,                # v1.3 F-5.1
+                    "ppid": ppid,                      # v1.3 F-6.2
+                    "parent_app": parent_app,          # v1.3 F-6.2
+                    "ja3": None,                       # v1.3 F-1.6 — populated after pcap parse
+                    "systemd_unit": systemd_unit,
+                    "session_age_s": None,           # filled in monitor()
+                    "crowdsec": None,                # filled in monitor()
+                    "firewall": None,                # filled in monitor()
                     "country": ip_info["country"],
                     "country_code": ip_info["country_code"],
                     "org": ip_info["org"],
@@ -1767,6 +4550,14 @@ class SecurityMonitor:
                     "vt": None,
                     "risk": "LOW",
                     "flags": [],
+                    # v1.3 UX: tag rows owned by this netmon process (or its
+                    # children — pktmon/tcpdump/PowerShell sig-verifier) so
+                    # the HTML report can hide them by default. Without this
+                    # filter the analyst's first view is polluted by the
+                    # monitor's own footprint (Python's HTTPS to ipwho.is,
+                    # transient PowerShell sockets, etc.).
+                    "is_netmon_self": (pid in self_pids
+                                       or (ppid is not None and ppid in self_pids)),
                 }
                 connections.append(conn_data)
             except (psutil.Error, OSError, ValueError) as e:
@@ -1784,6 +4575,65 @@ class SecurityMonitor:
         if ":" in ip:
             return f"[{ip}]:{port}"
         return f"{ip}:{port}"
+
+    # v1.3 (F-1.1, F-1.2): pull in SCTP + Unix domain sockets as additional
+    # rows in the connection table. These transports are invisible to
+    # psutil.net_connections(kind="inet") and to the existing pcap parser.
+    def get_alt_transports(self):
+        rows = []
+        for s in enumerate_sctp():
+            rows.append(self._make_alt_row(s, transport="sctp"))
+        for s in enumerate_unix_sockets():
+            rows.append(self._make_alt_row(s, transport="unix"))
+        return rows
+
+    def _make_alt_row(self, sock, transport):
+        pid = sock.get("pid")
+        app_name, exe_path, username = "Unknown", "N/A", "N/A"
+        cmdline = ""; ppid = None; parent_app = ""
+        if pid:
+            try:
+                proc = psutil.Process(pid)
+                app_name = proc.name()
+                exe_path = proc.exe()
+                username = proc.username()
+                try:
+                    cmdline = " ".join(proc.cmdline())[:4096]
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    pass
+                try:
+                    ppid = proc.ppid()
+                    if ppid:
+                        parent_app = psutil.Process(ppid).name()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                    pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                app_name = "System/Protected"; exe_path = "Access Denied"
+        # For SCTP the remote field is populated for assocs; UDS has none.
+        remote = sock.get("remote") or ""
+        local = sock.get("local") or ""
+        return {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pid": pid, "app": app_name, "user": username,
+            "path": exe_path, "hash": "N/A",
+            "local": local, "remote": remote,
+            "remote_ip": self._remote_ip(remote) if remote else None,
+            "remote_port": self._remote_port(remote) if remote else None,
+            "status": sock.get("status") or "NONE",
+            "direction": "LISTEN" if not remote else (
+                "LOOPBACK" if (self._remote_ip(remote) or "").startswith("127.") else "AMBIGUOUS"
+            ),
+            "transport": transport,
+            "cmdline": cmdline, "ppid": ppid, "parent_app": parent_app,
+            "ja3": None,
+            "systemd_unit": systemd_unit_for_pid(pid) if pid else None,
+            "session_age_s": None, "crowdsec": None, "firewall": None,
+            "country": "—", "country_code": "",
+            "org": f"{transport.upper()} socket",
+            "asn": None, "hostname": "N/A", "is_tor": False,
+            "signature": None, "vt": None,
+            "risk": "LOW", "flags": [],
+        }
 
     def monitor(self):
         start = datetime.now()
@@ -1815,6 +4665,8 @@ class SecurityMonitor:
                     if len(self.first_seen) < MAX_FIRST_SEEN:
                         fs_key = (conn["pid"], conn["local"], conn["remote"])
                         self.first_seen.setdefault(fs_key, now)
+                        # Track session-start wall time for the session-age column
+                        self.session_start.setdefault(fs_key, now)
                 time.sleep(1)
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Monitoring interrupted by user.[/yellow]")
@@ -1833,10 +4685,11 @@ class SecurityMonitor:
                 except (struct.error, ValueError, OSError) as e:
                     log.warning("pcap parse error: %s", e)
                     self.console.print(f"[yellow]pcap parse error: {e}[/yellow]")
-                # Persist the pcap to the user's location if --save-capture was given.
-                if self.args.save_capture:
+                # Persist the pcap to the user's location if requested.
+                # v1.3 (T2-5): --capture saves by default; --capture-fly skips.
+                if getattr(self.args, "capture_save", False) and getattr(self.args, "capture_path", None):
                     try:
-                        dest = Path(self.args.save_capture).resolve()
+                        dest = Path(self.args.capture_path).resolve()
                         shutil.copy2(pcap_path, dest)
                         size = dest.stat().st_size
                         self.saved_pcap_path = str(dest)
@@ -1878,7 +4731,10 @@ class SecurityMonitor:
         # DNS heuristics (DGA-like, suspicious TLD, invalid chars, NXDOMAIN burst)
         self.dns_findings = []
         if self.flow and self.flow.dns_queries:
-            analyzer = DNSAnalyzer(self.flow.dns_queries)
+            analyzer = DNSAnalyzer(
+                self.flow.dns_queries,
+                rcode_counts=getattr(self.flow, "dns_rcode_counts", None),
+            )
             self.dns_findings = analyzer.suspicious_summary()
             # Map suspicious-DNS findings onto any connection whose hostname matches.
             suspicious_by_name = {r["qname"].rstrip(".").lower(): r["flags"]
@@ -1892,14 +4748,113 @@ class SecurityMonitor:
                             if f not in conn["flags"]:
                                 conn["flags"].append(f)
 
-        # Batch signature verification (one PowerShell call) and VT lookups
-        self.console.print("[dim]Verifying code signatures...[/dim]")
+        # Batch signature / package verification and VT lookups
+        self.console.print("[dim]Verifying code signatures / packages...[/dim]")
         all_paths = [c["path"] for c in self.conn_history.values()]
         self.signing.batch_check(all_paths)
         for conn in self.conn_history.values():
             conn["signature"] = self.signing.get(conn["path"])
             if self.vt:
                 conn["vt"] = self.vt.lookup_hash(conn["hash"])
+
+        # CrowdSec lookups for every unique public remote IP (T2-1)
+        if self.crowdsec and self.crowdsec.enabled:
+            self.console.print("[dim]Querying local CrowdSec...[/dim]")
+            for conn in self.conn_history.values():
+                ip = conn.get("remote_ip")
+                if ip:
+                    conn["crowdsec"] = self.crowdsec.lookup(ip)
+
+        # Firewall per-port verdict (T2-3)
+        if self.firewall and self.firewall.backend:
+            for conn in self.conn_history.values():
+                # For listeners, the local port is what's exposed; for active
+                # connections we still annotate the local port (the listener's
+                # accept side) so a daemon row carries its allow/deny verdict.
+                lport = self._local_port(conn["local"])
+                if lport is not None:
+                    conn["firewall"] = self.firewall.verdict_for_port(lport)
+
+        # Session age (T3-1): wall-clock seconds since the (pid, local, remote)
+        # tuple was first observed in this run. Best-effort — for ESTABLISHED
+        # sockets older than the run, this just reflects "since we noticed it".
+        run_now = time.time()
+        for conn in self.conn_history.values():
+            fs_key = (conn["pid"], conn["local"], conn["remote"])
+            start = self.session_start.get(fs_key)
+            if start is not None:
+                conn["session_age_s"] = round(max(0.0, run_now - start), 1)
+
+        # v1.3: pull in SCTP + Unix-domain socket rows (F-1.1, F-1.2). These
+        # are point-in-time snapshots, not continuously monitored — sufficient
+        # for "is there an active SCTP association / suspicious UDS attach?".
+        for row in self.get_alt_transports():
+            key = (row["pid"], row["transport"], row["local"], row["remote"])
+            self.conn_history[key] = row
+
+        # v1.3 F-1.6: thread JA3 fingerprint per connection if we captured TLS.
+        if self.flow and getattr(self.flow, "ja3_by_peer", None):
+            for conn in self.conn_history.values():
+                ip = conn.get("remote_ip")
+                if ip and ip in self.flow.ja3_by_peer:
+                    conn["ja3"] = next(iter(self.flow.ja3_by_peer[ip]))
+
+        # v1.3 F-1.3: mark connections whose remote_ip showed up in the
+        # ICMP-tunnel findings from FlowAnalyzer.
+        if self.flow:
+            self.flow._compute_icmp_findings()
+            tunnel_peers = {f["peer"] for f in self.flow.icmp_findings}
+            for conn in self.conn_history.values():
+                if conn.get("remote_ip") in tunnel_peers:
+                    conn["icmp_tunnel"] = True
+
+        # v1.3 F-2.3: webroot content scan (opt-in via --scan-webroots).
+        if getattr(self.args, "scan_webroots", False):
+            self.console.print("[dim]Scanning webroots for shell signatures...[/dim]")
+            roots = getattr(self.args, "webroots", None) or DEFAULT_WEBROOTS
+            scanner = WebShellScanner(roots=roots)
+            self.webshell_findings = scanner.scan()
+            if self.webshell_findings:
+                self.console.print(
+                    f"[bold red]WebShell scan: {len(self.webshell_findings)} suspicious files![/bold red]"
+                )
+
+        # v1.3 F-4: persistence enumeration (opt-in via --persistence).
+        # --hash-tasks implies --persistence so a "hash only" run still works.
+        if getattr(self.args, "persistence", False) or getattr(self.args, "hash_tasks", False):
+            self.console.print("[dim]Enumerating persistence mechanisms...[/dim]")
+            self.persistence_findings = PersistenceScanner().scan()
+            if getattr(self.args, "hash_tasks", False):
+                self.console.print("[dim]Hashing persistence binaries...[/dim]")
+                self._hash_persistence_binaries()
+
+        # v1.3 F-3: host event log review (opt-in via --logs N).
+        logs_minutes = getattr(self.args, "logs", None)
+        if logs_minutes:
+            self.console.print(f"[dim]Reading host event logs (last {logs_minutes} minutes)...[/dim]")
+            reader = LogReader(logs_minutes)
+            self.log_findings = reader.read_all()
+            self.log_findings.extend(correlate_log_findings(self.log_findings))
+            # Re-sort with derived correlation entries
+            self.log_findings.sort(key=lambda e: e.get("timestamp_unix", 0), reverse=True)
+            self.console.print(
+                f"[dim]Collected {len(self.log_findings)} log entries from "
+                f"{len(reader.sources_read)} sources.[/dim]"
+            )
+            # v1.3: surface skipped sources so the operator knows WHY a log
+            # contributed zero entries. Most common reason on Windows is
+            # "access denied" because the Security log requires admin and
+            # the user is running non-elevated.
+            self.log_sources_skipped = list(getattr(reader, "sources_skipped", []))
+            if self.log_sources_skipped:
+                self.console.print("[yellow]Some log sources were skipped:[/yellow]")
+                for src, reason in self.log_sources_skipped:
+                    self.console.print(f"  [yellow]·[/yellow] {src}: {reason}")
+                if any("access denied" in r for _, r in self.log_sources_skipped):
+                    self.console.print(
+                        "  [dim]Re-run as Administrator for full Security-log "
+                        "coverage (logon events, process creation, etc).[/dim]"
+                    )
 
         # Final risk analysis (after all enrichment is in place)
         for conn in self.conn_history.values():
@@ -1929,12 +4884,47 @@ class SecurityMonitor:
 
         return self.conn_history
 
+    # v1.3: --hash-tasks — SHA-256 every persistence-entry binary and (if a
+    # VT key is set) look it up in VirusTotal. Result lives on the entry as
+    # binary_path / binary_hash / vt so the HTML/JSON renderers can show it.
+    def _hash_persistence_binaries(self):
+        for entry in self.persistence_findings:
+            cmd = entry.get("command") or ""
+            path = entry.get("path") or ""
+            # 1. Try to extract a binary path from the command itself.
+            bin_path = PersistenceScanner.extract_binary_path(cmd)
+            # 2. Fallbacks for entries where `command` is empty or doesn't
+            # contain a path (e.g. some launchd plists, ssh_key entries):
+            #   - cron jobs already keep the first non-comment line as cmd
+            #   - launchd: the .plist itself is the persistence artifact
+            #   - ssh_key: skip (it's a key, not a binary)
+            if not bin_path and entry.get("kind") == "launchd":
+                bin_path = path
+            if not bin_path:
+                continue
+            if not os.path.isfile(bin_path):
+                # Path didn't resolve — note it so the analyst sees the
+                # cmd referenced a nonexistent file (which can itself be
+                # suspicious — leftover startup entry from removed malware).
+                entry["binary_path"] = bin_path
+                entry["binary_hash"] = "NOT_FOUND"
+                continue
+            entry["binary_path"] = bin_path
+            entry["binary_hash"] = self.get_file_hash(bin_path)
+            if self.vt and entry["binary_hash"] not in (
+                    "N/A", "ACCESS_DENIED", "TOO_LARGE", "NOT_FOUND"):
+                entry["vt"] = self.vt.lookup_hash(entry["binary_hash"])
+
 
 # === Reporters ===
 
 CSV_FIELDS = [
-    "timestamp", "pid", "app", "user", "path", "hash",
+    "timestamp", "pid", "ppid", "app", "parent_app", "user", "path", "hash",
     "local", "remote", "status",
+    # v1.3 additions
+    "transport",
+    "direction", "systemd_unit", "session_age_s", "crowdsec", "firewall",
+    "cmdline", "ja3",
     "country", "country_code", "org", "asn", "hostname",
     "is_tor", "signature_status", "signature_publisher", "signature_trusted",
     "vt_malicious", "vt_suspicious",
@@ -2068,6 +5058,95 @@ def export_text(conn_history, path, console, args=None, flow=None,
         console.print(f"[bold red]Text export failed:[/bold red] {e}")
 
 
+# JSON / NDJSON output (v1.3 F-6.4 — schema-stable for SIEM ingestion).
+# Note: fields kept flat where possible so the schema is greppable from a
+# command line; nested fields use snake_case dict keys.
+def _conn_to_jsonable(c):
+    sig = c.get("signature") or {}
+    vt = c.get("vt") or {}
+    return {
+        "timestamp": c.get("timestamp"),
+        "pid": c.get("pid"),
+        "ppid": c.get("ppid"),
+        "app": c.get("app"),
+        "parent_app": c.get("parent_app"),
+        "user": c.get("user"),
+        "cmdline": c.get("cmdline"),
+        "path": c.get("path"),
+        "hash": c.get("hash"),
+        "transport": c.get("transport"),
+        "local": c.get("local"),
+        "remote": c.get("remote"),
+        "remote_ip": c.get("remote_ip"),
+        "remote_port": c.get("remote_port"),
+        "status": c.get("status"),
+        "direction": c.get("direction"),
+        "session_age_s": c.get("session_age_s"),
+        "systemd_unit": c.get("systemd_unit"),
+        "crowdsec": c.get("crowdsec"),
+        "firewall": c.get("firewall"),
+        "ja3": c.get("ja3"),
+        "country": c.get("country"),
+        "country_code": c.get("country_code"),
+        "org": c.get("org"),
+        "asn": c.get("asn"),
+        "hostname": c.get("hostname"),
+        "is_tor": bool(c.get("is_tor")),
+        "signature": {
+            "signed": sig.get("signed", False),
+            "publisher": sig.get("publisher"),
+            "status": sig.get("status"),
+            "trusted": sig.get("trusted", False),
+            "tampered": sig.get("tampered", False),
+        },
+        "vt": {
+            "found": vt.get("found", False),
+            "malicious": vt.get("malicious", 0),
+            "suspicious": vt.get("suspicious", 0),
+        } if vt else None,
+        "risk": c.get("risk"),
+        "flags": list(c.get("flags") or []),
+    }
+
+
+def export_json(conn_history, monitor, path, console):
+    """Single-document JSON: connection rows + log findings + persistence +
+    webshell findings + flow summary. Stable schema; new keys are appended."""
+    doc = {
+        "tool": f"netmon.py/{VERSION}",
+        "host": socket.gethostname(),
+        "generated": datetime.now().isoformat(),
+        "connections": [_conn_to_jsonable(c) for c in conn_history.values()],
+        "log_findings": getattr(monitor, "log_findings", []) or [],
+        "log_sources_skipped": getattr(monitor, "log_sources_skipped", []) or [],
+        "persistence":  getattr(monitor, "persistence_findings", []) or [],
+        "webshell":     getattr(monitor, "webshell_findings", []) or [],
+        "dns_findings": getattr(monitor, "dns_findings", []) or [],
+        "flow_summary": monitor.flow.summary() if monitor.flow else None,
+    }
+    try:
+        Path(path).write_text(json.dumps(doc, default=str, indent=2),
+                              encoding="utf-8")
+        console.print(f"[bold green]JSON exported:[/bold green] {path}")
+    except OSError as e:
+        log.error("JSON export failed: %s", e)
+        console.print(f"[bold red]JSON export failed:[/bold red] {e}")
+
+
+def export_ndjson(conn_history, path, console):
+    """Newline-delimited JSON — one connection per line, suitable for tail-F
+    ingestion by Loki/Splunk/ELK."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for c in conn_history.values():
+                f.write(json.dumps(_conn_to_jsonable(c), default=str))
+                f.write("\n")
+        console.print(f"[bold green]NDJSON exported:[/bold green] {path}")
+    except OSError as e:
+        log.error("NDJSON export failed: %s", e)
+        console.print(f"[bold red]NDJSON export failed:[/bold red] {e}")
+
+
 def export_csv(conn_history, path, console):
     if not conn_history:
         return
@@ -2085,6 +5164,13 @@ def export_csv(conn_history, path, console):
                 row["vt_malicious"] = vt.get("malicious", "") if vt else ""
                 row["vt_suspicious"] = vt.get("suspicious", "") if vt else ""
                 row["flags"] = ", ".join(c.get("flags") or [])
+                # v1.3 — direction/systemd_unit/crowdsec/firewall already
+                # populated via base dict copy; coerce None -> "" so CSV is clean.
+                for k in ("direction", "systemd_unit", "crowdsec", "firewall",
+                          "session_age_s", "transport", "cmdline", "ja3",
+                          "ppid", "parent_app"):
+                    if row.get(k) is None:
+                        row[k] = ""
                 writer.writerow(row)
         console.print(f"[bold green]CSV exported:[/bold green] {path}")
     except (OSError, csv.Error) as e:
@@ -2189,6 +5275,28 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .control-group-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-right: 4px; }
   .status-btn { font-size: 11px; padding: 3px 8px; }
+  /* v1.3: persistent "Showing X of Y" pill. Always visible next to the
+     risk-filter buttons so the operator can never be confused about
+     whether a filter is hiding rows. Goes amber when filtered. */
+  .row-count {
+    margin-left: auto;
+    background: var(--panel); border: 1px solid var(--border);
+    color: var(--muted); padding: 4px 10px; border-radius: 4px;
+    font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .row-count.filtered {
+    color: var(--orange); border-color: var(--orange);
+    background: rgba(255, 165, 0, 0.08);
+  }
+  /* # column — narrow, right-aligned, dimmed */
+  #conntable th.col-num, #conntable td.row-num {
+    width: 36px; text-align: right; color: var(--muted);
+    font-variant-numeric: tabular-nums; user-select: none;
+  }
+  /* Pkts column — compact mono-style for the count · bytes display */
+  #conntable th[data-sort="pkts"], #conntable td.pkts {
+    text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
   /* Process selection: the process name cell is a button-styled clickable
      element so the affordance is unambiguous. Whole-row click also works
      as a fallback for clicks anywhere outside the VT hash link. */
@@ -2219,6 +5327,11 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
     display: none; padding: 8px 12px; margin-bottom: 12px;
     background: rgba(88, 166, 255, 0.10); border: 1px solid var(--accent);
     border-radius: 6px; color: var(--text); font-size: 12px;
+    /* v1.3 T3-6: sticky so the operator never loses track of which process
+       is selected even after scrolling deep into the packet log. */
+    position: sticky; top: 0; z-index: 20;
+    backdrop-filter: blur(6px);
+    background-color: rgba(22, 27, 34, 0.92);
   }
   #process-selection-indicator.visible { display: block; }
   #process-selection-indicator .name { color: var(--accent); font-weight: 600; }
@@ -2239,6 +5352,15 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   tr.MED { background: rgba(210, 153, 34, 0.06); }
   /* Hide Microsoft + System rows by default; checkbox below toggles them. */
   body:not(.show-noisy) tr.noisy { display: none; }
+  /* v1.3 UX: hide rows owned by netmon (and its child processes) by
+     default so the analyst doesn't see the monitor's own footprint.
+     The "Show netmon-generated events" checkbox reveals them. */
+  body:not(.show-netmon) tr.cat-netmon-self { display: none; }
+  /* Same pattern for log-table events generated by netmon. The toggle
+     "Show events generated by netmon.py" in the log section drives this. */
+  body:not(.show-netmon-logs) tr.self-event { display: none; }
+  /* SELF severity pill — neutral gray, not red/orange/green. */
+  .risk.noisy-self { background: var(--muted); color: var(--bg); }
   .risk { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; }
   .risk.HIGH { background: var(--red); color: #fff; }
   .risk.MED { background: var(--orange); color: #fff; }
@@ -2271,7 +5393,7 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   .packet-hex .hex-byte { color: var(--text); }
   .packet-hex .ascii { color: var(--green); }
   /* Listener-exposure highlighting — make exposed listeners shine */
-  /* Remote cell is the 6th td: Risk, Process, PID, Signed, Local, Remote, ... */
+  /* Remote cell is the 6th td: Risk, Process, PID, Trust, Local, Remote, ... */
   tr.cat-exposed-any   td:nth-child(6) {
     border-left: 4px solid var(--red);
     color: var(--red);
@@ -2286,22 +5408,117 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
     background: rgba(210, 153, 34, 0.08);
     box-shadow: inset 0 0 8px rgba(210, 153, 34, 0.14);
   }
+  /* v1.3 — Direction column visual cues */
+  td.dir { font-weight: 600; font-size: 11px; white-space: nowrap; }
+  td.dir.dir-out    { color: var(--orange); }
+  td.dir.dir-in     { color: var(--accent); }
+  td.dir.dir-loop   { color: var(--muted); }
+  td.dir.dir-listen { color: var(--green); }
+  td.age { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .dns-flag { display: inline-block; background: rgba(248, 81, 73, 0.15); color: var(--red); padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-right: 4px; }
   .pcap-link { display: inline-block; background: var(--accent); color: #fff; padding: 6px 12px; border-radius: 4px; text-decoration: none; font-weight: 600; }
   .pcap-link:hover { opacity: 0.9; }
   .log-table { font-size: 11px; }
   .log-table td { padding: 4px 8px; word-break: break-all; }
+
+  /* === v1.3 UX overhaul ====================================================
+     The HTML grew big: connection table + capture summary + DNS findings +
+     packet log + host event logs + persistence + web-shell findings. Without
+     a quick-nav the analyst has to scroll past 100+ rows to reach the
+     persistence section. The sticky TOC fixes that.
+  */
+  .toc {
+    position: sticky; top: 0; z-index: 30;
+    background: rgba(13, 17, 23, 0.94);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 12px;
+    display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    margin: 0 -20px 16px; /* extend to edges */
+    font-size: 12px;
+  }
+  .toc-label {
+    color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+    font-size: 10px; margin-right: 4px;
+  }
+  .toc a {
+    color: var(--text); text-decoration: none;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px;
+    display: inline-flex; align-items: center; gap: 6px;
+    transition: border-color .15s, background .15s;
+  }
+  .toc a:hover { border-color: var(--accent); }
+  .toc a.has-hi { border-color: var(--red); }
+  .toc a .badge {
+    background: var(--bg); color: var(--muted);
+    padding: 1px 6px; border-radius: 9px; font-size: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .toc a.has-hi .badge { background: var(--red); color: #fff; }
+  .toc a .badge.warn { background: var(--orange); color: #fff; }
+
+  /* Back-to-top floating button */
+  #back-to-top {
+    position: fixed; bottom: 20px; right: 20px; z-index: 50;
+    background: var(--accent); color: #fff; border: none;
+    width: 40px; height: 40px; border-radius: 50%;
+    cursor: pointer; font-size: 18px; font-weight: 700;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    display: none; align-items: center; justify-content: center;
+  }
+  #back-to-top.visible { display: flex; }
+  #back-to-top:hover { opacity: .9; }
+
+  /* Section headers — bigger summary text, more visual weight */
+  details > summary {
+    cursor: pointer; padding: 10px 14px; user-select: none;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; font-weight: 600; font-size: 14px;
+    margin-top: 16px;
+  }
+  details[open] > summary {
+    background: var(--bg);
+    border-color: var(--accent); border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  details > summary:hover { border-color: var(--accent); }
+  details > summary .count-badge {
+    display: inline-block; margin-left: 8px;
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 1px 8px; border-radius: 9px; font-size: 11px;
+    font-weight: 500; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  details > summary .count-badge.has-hi { background: var(--red); color: #fff; border-color: var(--red); }
+  details > summary .count-badge.warn   { background: var(--orange); color: #fff; border-color: var(--orange); }
+  details > summary .count-badge.ok     { background: var(--green); color: #fff; border-color: var(--green); }
+  /* Empty-state callout — used when a section has nothing to report. */
+  .empty-state {
+    padding: 12px 16px; color: var(--muted);
+    background: var(--panel); border: 1px dashed var(--border);
+    border-radius: 4px; margin: 8px 0;
+    font-size: 12px;
+  }
+  .empty-state strong { color: var(--green); }
+  /* Anchor offset so sticky-header doesn't cover the section heading */
+  section[id], details[id] { scroll-margin-top: 60px; }
 </style>
 </head>
 <body class="$body_class">
 <h1>netmon.py Report</h1>
 <div class="sub">Generated $generated &middot; Duration ${duration}s &middot; Captured $conn_count unique connections &middot; Host: $host_os</div>
 
+$toc_html
+
+<button id="back-to-top" title="Back to top" aria-label="Back to top">^</button>
+
 <div class="stats">
   <div class="stat" data-filter="HIGH" title="Click to filter to HIGH-risk rows"><div class="label">High risk</div><div class="val" style="color: var(--red)">$high</div></div>
   <div class="stat" data-filter="MED" title="Click to filter to MED-risk rows"><div class="label">Medium risk</div><div class="val" style="color: var(--orange)">$med</div></div>
   <div class="stat" data-filter="LOW" title="Click to filter to LOW-risk rows"><div class="label">Low risk</div><div class="val" style="color: var(--green)">$low</div></div>
   <div class="stat" data-filter="dedupe-process" title="Click to show one representative row per unique process name"><div class="label">Unique processes</div><div class="val">$procs</div></div>
+  <div class="stat" data-filter="collapse-app-pid" title="Click to collapse multi-flow processes into one row per (app, pid). Useful on busy hosts."><div class="label">Collapse by PID</div><div class="val">▦</div></div>
   <div class="stat" data-filter="cat-external" title="Click to filter to external peers"><div class="label">External peers</div><div class="val">$peers</div></div>
   <div class="stat" data-filter="cat-unsigned" title="Click to filter to unsigned binaries"><div class="label">Unsigned binaries</div><div class="val" style="color: var(--orange)">$unsigned</div></div>
   <div class="stat" data-filter="cat-exposed-any" title="Click to filter to listeners on ANY interface (0.0.0.0 / [::])"><div class="label">Exposed: any iface</div><div class="val" style="color: var(--red)">$exposed_any</div></div>
@@ -2318,6 +5535,8 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   <button class="filter-btn" data-risk="MED">Medium</button>
   <button class="filter-btn" data-risk="LOW">Low</button>
   $noise_toggle
+  $netmon_self_toggle
+  <span id="row-count-pill" class="row-count" title="Visible rows vs total. Always shows the current filter effect so you never forget a filter is active.">Showing 0 of 0</span>
 </div>
 <div class="controls">
   <span class="control-group-label">Status:</span>
@@ -2339,16 +5558,22 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   <button id="clear-selection">Clear</button>
 </div>
 
+<section id="section-connections" class="anchor-wrap">
 <table id="conntable">
 <thead>
 <tr>
+  <th data-sort="num" class="col-num" title="Row number among currently-visible rows. Updates when filters change.">#</th>
   <th data-sort="risk">Risk</th>
   <th data-sort="app">Process</th>
   <th data-sort="pid">PID</th>
-  <th data-sort="sig">Signed</th>
+  <th data-sort="sig">Trust</th>
   <th data-sort="local">Local</th>
   <th data-sort="remote">Remote</th>
+  <th data-sort="dir">Dir</th>
   <th data-sort="geo">Geo / Org</th>
+  <th data-sort="age">Age</th>
+  $pkts_th
+  <th data-sort="svc">Service</th>
   <th data-sort="path">Path / Hash</th>
   <th data-sort="vt">VT</th>
   <th data-sort="flags">Flags</th>
@@ -2358,7 +5583,11 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
 $rows
 </tbody>
 </table>
+</section>
 
+$webshell_section
+$log_section
+$persistence_section
 $dns_section
 $capture_section
 $packet_log_section
@@ -2379,6 +5608,21 @@ $packet_log_section
 <span class="k">DNS_SUSPICIOUS_TLD_*</span><span>Resolved domain uses an abuse-prone TLD (.tk, .xyz, .top, etc).</span>
 <span class="k">DNS_INVALID_CHARS</span><span>DNS query contained characters not legal in a hostname (homoglyph / typed garbage).</span>
 <span class="k">DNS_HIGH_RETRY_*</span><span>Same name queried many times (typical of NXDOMAIN beacon).</span>
+<span class="k">INBOUND_SESSION</span><span>v1.3 — informational; we are the server side of this TCP socket.</span>
+<span class="k">INBOUND_FROM_TOR</span><span>v1.3 — inbound connection sourced from a Tor exit. Suspicious for exposed services.</span>
+<span class="k">REVERSE_SHELL_LIKELY</span><span>v1.3 — server-role daemon (sshd, apache2…) making an outbound call to a public IP.</span>
+<span class="k">IMPOSTOR_LISTEN_PORT</span><span>v1.3 — known server binary bound to an unexpected port (e.g. sshd on :8888).</span>
+<span class="k">PACKAGE_TAMPERED</span><span>v1.3 — Linux package-manager integrity check (dpkg -V / rpm -V) reports the binary differs from its package.</span>
+<span class="k">CROWDSEC_BANNED</span><span>v1.3 — local CrowdSec instance has an active ban decision on the remote IP.</span>
+<span class="k">WEB_SHELL_SPAWN</span><span>v1.3 — web server (apache/nginx/IIS) spawned a shell, interpreter, or net tool — textbook web-shell signature.</span>
+<span class="k">WEBUSER_OUTBOUND</span><span>v1.3 — web-runtime user (www-data, IUSR…) making outbound to a public IP. Web servers don't dial out.</span>
+<span class="k">DOH_FROM_NON_BROWSER</span><span>v1.3 — DNS-over-HTTPS endpoint hit by a non-browser process. Covert C2 indicator.</span>
+<span class="k">SCTP_UNUSUAL</span><span>v1.3 — SCTP association to a public IP. Outside telco contexts, almost never legitimate.</span>
+<span class="k">UNIX_SOCKET_DOCKER</span><span>v1.3 — non-root process attached to /var/run/docker.sock. Container-escape precursor.</span>
+<span class="k">JA3_C2_*</span><span>v1.3 — TLS Client Hello fingerprint (JA3) matched a known C2 framework profile.</span>
+<span class="k">ICMP_TUNNEL_LIKELY</span><span>v1.3 — peer received high-volume ICMP echo traffic with large payloads (≥50 pkts, avg ≥1000B).</span>
+<span class="k">SUSPICIOUS_CMDLINE_*</span><span>v1.3 — process cmdline matched a known dropper/loader/reverse-shell pattern.</span>
+<span class="k">WEBSHELL_SIGNATURE_*</span><span>v1.3 — file under a webroot matched a web-shell content signature.</span>
 </div>
 </details>
 
@@ -2393,8 +5637,10 @@ $packet_log_section
   const riskButtons = document.querySelectorAll('.filter-btn:not(.status-btn)');
   const statusButtons = document.querySelectorAll('.filter-btn.status-btn');
   const noiseToggle = document.getElementById('show-noisy');
+  const netmonToggle = document.getElementById('show-netmon');
   const statTiles = document.querySelectorAll('.stat[data-filter]');
   const pcapTables = document.querySelectorAll('.log-table tbody');
+  const rowCountPill = document.getElementById('row-count-pill');
 
   // Filter state:
   //   activeRisk    — risk dimension: 'all' / 'HIGH' / 'MED' / 'LOW'
@@ -2430,20 +5676,32 @@ $packet_log_section
     body.classList.toggle('show-noisy', explicit || (noiseToggle && noiseToggle.checked));
 
     const seenProc = new Set();
+    const seenAppPid = new Set();
+    const collapseAppPid = activeCategories.has('collapse-app-pid');
+    // Cells indices changed in v1.3: a # column was prepended, so Process is
+    // now cells[2] (was cells[1]) and PID is cells[3] (was cells[2]). All
+    // cell lookups in this file use the new positions.
     rows.forEach(r => {
       const matchesText = !q || r.textContent.toLowerCase().includes(q);
       const matchesRisk = activeRisk === 'all' || r.classList.contains(activeRisk);
       const matchesStatus = activeStatus === 'all' || r.classList.contains(activeStatus);
       let matchesCats = true;
       activeCategories.forEach(cat => {
-        if (cat === 'dedupe-process') return;
+        if (cat === 'dedupe-process' || cat === 'collapse-app-pid') return;
         if (!r.classList.contains(cat)) matchesCats = false;
       });
       let visible = matchesText && matchesRisk && matchesStatus && matchesCats;
       if (visible && dedupeProcess) {
-        const proc = (r.cells[1].textContent || '').trim();
+        const proc = (r.cells[2].textContent || '').trim();
         if (seenProc.has(proc)) visible = false;
         else seenProc.add(proc);
+      }
+      if (visible && collapseAppPid) {
+        const proc = (r.cells[2].textContent || '').trim();
+        const pid  = (r.cells[3].textContent || '').trim();
+        const key = proc + ':' + pid;
+        if (seenAppPid.has(key)) visible = false;
+        else seenAppPid.add(key);
       }
       r.style.display = visible ? '' : 'none';
     });
@@ -2457,6 +5715,27 @@ $packet_log_section
         (!isRiskFilter(f) && activeCategories.has(f))
       );
     });
+
+    // v1.3 UX: renumber the visible rows in display order, AND update the
+    // "Showing X of Y" pill — runs on every filter change so the operator
+    // can ALWAYS see whether a filter is hiding rows. Without this, an
+    // accidentally-active filter (e.g. status=Established hiding LISTENs)
+    // can read as "no findings" when there are actually rows being hidden.
+    let visibleCount = 0;
+    rows.forEach(r => {
+      const numCell = r.cells[0];
+      if (r.style.display === 'none') {
+        if (numCell) numCell.textContent = '';
+      } else {
+        visibleCount += 1;
+        if (numCell) numCell.textContent = String(visibleCount);
+      }
+    });
+    if (rowCountPill) {
+      rowCountPill.textContent = 'Showing ' + visibleCount + ' of ' + rows.length;
+      // Visual hint: amber when a filter is hiding rows, dim when showing all.
+      rowCountPill.classList.toggle('filtered', visibleCount < rows.length);
+    }
 
     applyPcapFilter();
   }
@@ -2524,13 +5803,23 @@ $packet_log_section
     selectedProcess = proc;
     selectedProcessPorts = new Set();
     rows.forEach(rr => {
-      const proc2 = (rr.cells[1].textContent || '').trim();
+      const proc2 = (rr.cells[2].textContent || '').trim();
       if (proc2 === proc) {
-        const local = (rr.cells[4].textContent || '').trim();
-        const colon = local.lastIndexOf(':');
-        if (colon >= 0) {
-          const port = local.slice(colon + 1).replace(/[^0-9]/g, '');
-          if (port) selectedProcessPorts.add(port);
+        // v1.3 bug fix: pull the local port from the row-level data attribute
+        // instead of parsing cells[5].textContent. The textContent path broke
+        // once v1.3 started appending "fw: allowed" annotations into the same
+        // cell — lastIndexOf(':') would lock onto the colon in "fw:" and
+        // produce an empty selectedProcessPorts, leaving 0 matches when the
+        // user clicked "Load packets".
+        const port = rr.dataset.localPort;
+        if (port) selectedProcessPorts.add(port);
+        // Fallback: if data-local-port is missing (older row, manual edit),
+        // try to parse an IP:port pattern from the start of cells[5].
+        if (!port) {
+          const localTxt = (rr.cells[5].textContent || '').trim();
+          const m = localTxt.match(/^[0-9.]+:([0-9]+)|^\\[[0-9a-fA-F:]+\\]:([0-9]+)/);
+          const p2 = m ? (m[1] || m[2]) : null;
+          if (p2) selectedProcessPorts.add(p2);
         }
       }
       rr.classList.toggle('selected-process', proc2 === proc);
@@ -2587,7 +5876,7 @@ $packet_log_section
   function handleRowClick(r, evt) {
     // Let SHA-256 VT links work — we explicitly skip those.
     if (evt && evt.target && evt.target.tagName === 'A') return;
-    const proc = (r.cells[1].textContent || '').trim();
+    const proc = (r.cells[2].textContent || '').trim();
     if (!proc) return;
     // Flash the row briefly so the user always sees that the click registered,
     // even if (de)selection state is the same.
@@ -2604,7 +5893,7 @@ $packet_log_section
     // Specific clickable element on the process-name cell so the
     // affordance is unambiguous (the underline + accent color screams
     // "I am clickable").
-    const procCell = r.cells[1];
+    const procCell = r.cells[2];
     if (procCell) {
       const link = procCell.querySelector('.proc-link');
       if (link) {
@@ -2626,18 +5915,44 @@ $packet_log_section
     });
   }
 
-  document.querySelectorAll('th[data-sort]').forEach((th, idx) => {
+  // v1.3: netmon-self toggle. Same affordance as the Microsoft toggle —
+  // unchecked = hidden (the default), checked = visible. The body class
+  // drives the CSS rule on tr.cat-netmon-self.
+  if (netmonToggle) {
+    netmonToggle.addEventListener('change', () => {
+      body.classList.toggle('show-netmon', netmonToggle.checked);
+      applyFilters();   // re-renumber + update X-of-Y counter
+    });
+  }
+
+  // v1.3: same toggle for log events. Lives inside the Logs section and
+  // controls .self-event rows in the log tables.
+  const netmonLogToggle = document.getElementById('show-netmon-logs');
+  if (netmonLogToggle) {
+    netmonLogToggle.addEventListener('change', () => {
+      body.classList.toggle('show-netmon-logs', netmonLogToggle.checked);
+    });
+  }
+
+  document.querySelectorAll('th[data-sort]').forEach((th) => {
     let asc = true;
+    // v1.3: use th.cellIndex (the REAL column position) instead of the index
+    // inside the querySelectorAll result. The two stopped matching once the
+    // # / Pkts columns were added — querySelectorAll skips non-data-sort
+    // columns, so idx=0 was Risk but cells[0] was now the # column.
+    const colIdx = th.cellIndex;
     th.addEventListener('click', () => {
       const sorted = rows.slice().sort((a, b) => {
-        const av = a.cells[idx].getAttribute('data-sort') || a.cells[idx].textContent;
-        const bv = b.cells[idx].getAttribute('data-sort') || b.cells[idx].textContent;
+        const av = a.cells[colIdx].getAttribute('data-sort') || a.cells[colIdx].textContent;
+        const bv = b.cells[colIdx].getAttribute('data-sort') || b.cells[colIdx].textContent;
         const an = parseFloat(av), bn = parseFloat(bv);
         if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;
         return asc ? av.localeCompare(bv) : bv.localeCompare(av);
       });
       asc = !asc;
       sorted.forEach(r => tbody.appendChild(r));
+      // After sort, the visible-order changed → renumber rows.
+      applyFilters();
     });
   });
 
@@ -2770,6 +6085,17 @@ $packet_log_section
   const origApplyPcap = applyPcapFilter;
   applyPcapFilter = function() { origApplyPcap(); refreshLoadButton(); };
 
+  // v1.3 UX: floating back-to-top button. Shows after scrolling >400px.
+  const backToTop = document.getElementById('back-to-top');
+  if (backToTop) {
+    window.addEventListener('scroll', () => {
+      backToTop.classList.toggle('visible', window.scrollY > 400);
+    });
+    backToTop.addEventListener('click', () => {
+      window.scrollTo({top: 0, behavior: 'smooth'});
+    });
+  }
+
   // Apply initial filter — Status defaults to Established for the most useful
   // triage view; "All" or any other status button opens it up.
   applyFilters();
@@ -2781,24 +6107,308 @@ $packet_log_section
 
 
 def _is_noisy_microsoft_or_system(conn):
-    """Return True for trusted-Microsoft binaries and unprivileged System
-    placeholders. These rows are hidden by default in the HTML report on
-    Windows runs to reduce visual noise; a checkbox toggles them."""
+    """Return True for trusted-Microsoft binaries, unprivileged System
+    placeholders, and PID-0/(closed) orphaned TIME_WAIT residue. These
+    rows are hidden by default in the HTML report on Windows runs to
+    reduce visual noise; a checkbox toggles them."""
     app = (conn.get("app") or "").lower()
     sig = conn.get("signature") or {}
     publisher = (sig.get("publisher") or "").lower()
-    if app in ("system", "system/protected", "unknown"):
+    if app in ("system", "system/protected", "unknown", "(closed/pid-0)"):
         return True
     if sig.get("trusted") and "microsoft" in publisher:
         return True
     return False
 
 
+def _sev_class(sev):
+    """Map severity strings to existing risk-class CSS so colors stay consistent."""
+    s = (sev or "").upper()
+    if s in ("HIGH", "MED", "LOW"):
+        return s
+    return "LOW"
+
+
+def _render_log_section(findings, skipped=None):
+    """Render the host event-log review section (F-3). Default-collapsed
+    unless a HIGH finding exists. Surfaces skipped log sources (typically
+    Security log when not elevated) so the operator knows what's missing."""
+    if not findings and not skipped:
+        # v1.3 UX: always render an empty-state callout instead of omitting
+        # the section entirely. Lets the analyst confirm "yes the section is
+        # there, it just has nothing in it" — much less ambiguous than the
+        # section silently disappearing.
+        return ('<section id="section-logs">'
+                '<div class="empty-state">'
+                '<strong>Host event logs:</strong> no entries collected '
+                '(pass <code>--logs N</code> to read the last N minutes of '
+                'host event logs).'
+                '</div></section>')
+    has_high = any(e.get("severity") == "HIGH" for e in findings or [])
+    open_attr = " open" if has_high else ""
+    # SELF events (netmon's own runtime footprint) are excluded from
+    # severity counts on the section badge — they have their own toggle.
+    non_self = [e for e in (findings or [])
+                if e.get("severity") != "SELF"]
+    high_count = sum(1 for e in non_self if e.get("severity") == "HIGH")
+    med_count = sum(1 for e in non_self if e.get("severity") == "MED")
+    self_count = sum(1 for e in (findings or [])
+                     if e.get("severity") == "SELF")
+    badge_class = "has-hi" if high_count else ("warn" if med_count else "ok")
+    badge_label = (
+        f"{high_count} HIGH" if high_count else
+        f"{med_count} MED" if med_count else f"{len(non_self)} entries"
+    )
+    # Skipped-sources notice — rendered at the top of the section
+    skipped_html = ""
+    if skipped:
+        rows = "".join(
+            f'<tr><td>{html_mod.escape(src)}</td>'
+            f'<td>{html_mod.escape(reason)}</td></tr>'
+            for src, reason in skipped
+        )
+        skipped_html = (
+            f'<p class="muted">Skipped log sources — these contributed zero '
+            f'entries. Most commonly because the process needs Administrator '
+            f'to read the Security log:</p>'
+            f'<table class="log-table"><thead><tr><th>Source</th>'
+            f'<th>Reason</th></tr></thead><tbody>{rows}</tbody></table>'
+        )
+    if not findings:
+        return f"""
+<section id="section-logs">
+<details open id="logs-details">
+<summary>Host event log review<span class="count-badge warn">no events in window</span></summary>
+{skipped_html}
+</details>
+</section>
+"""
+    by_source = defaultdict(list)
+    for e in findings:
+        by_source[e.get("source", "?")].append(e)
+    src_html = [skipped_html] if skipped_html else []
+    # v1.3 UX: 'Show events generated by netmon.py (N hidden)' toggle.
+    # Renders only when at least one SELF event exists; otherwise omitted.
+    if self_count:
+        src_html.append(
+            f'<label class="toggle" title="Events generated by netmon\'s own '
+            f'PowerShell invocations (Get-AuthenticodeSignature, '
+            f'Get-ScheduledTask, Get-WinEvent, etc.) and the runtime '
+            f'scaffolding they trigger. Hidden by default so the report '
+            f'shows host activity, not the monitor\'s footprint.">'
+            f'<input type="checkbox" id="show-netmon-logs"> '
+            f'Show events generated by netmon.py ({self_count} hidden)</label>'
+        )
+    for source, entries in sorted(by_source.items(), key=lambda kv: -len(kv[1])):
+        rows = []
+        for e in entries[:500]:
+            sev_raw = e.get("severity") or "LOW"
+            sev_class = "noisy-self" if sev_raw == "SELF" else _sev_class(sev_raw)
+            row_classes = "self-event" if sev_raw == "SELF" else ""
+            display_sev = "SELF" if sev_raw == "SELF" else _sev_class(sev_raw)
+            ip = e.get("src_ip") or ""
+            user = e.get("user") or ""
+            msg = e.get("message") or ""
+            rows.append(
+                f'<tr class="{row_classes}">'
+                f'<td>{html_mod.escape(e.get("timestamp", ""))}</td>'
+                f'<td><span class="risk {sev_class}">{html_mod.escape(display_sev)}</span></td>'
+                f'<td>{html_mod.escape(e.get("event_id", ""))}</td>'
+                f'<td>{html_mod.escape(user)}</td>'
+                f'<td>{html_mod.escape(ip)}</td>'
+                f'<td class="path">{html_mod.escape(msg)}</td></tr>'
+            )
+        # Count only non-SELF entries for the source-section badge.
+        non_self_count = sum(1 for e in entries if e.get("severity") != "SELF")
+        self_in_src = len(entries) - non_self_count
+        sub = (f"{non_self_count}"
+               + (f" + {self_in_src} netmon-self" if self_in_src else ""))
+        src_html.append(
+            f"<h3 style='margin-top:14px'>{html_mod.escape(source)} "
+            f"({sub})</h3>"
+            f"<table class='log-table'><thead><tr>"
+            f"<th>Time</th><th>Sev</th><th>Event</th><th>User</th><th>Source IP</th><th>Message</th>"
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+        )
+    return f"""
+<section id="section-logs">
+<details{open_attr} id="logs-details">
+<summary>Host event log review<span class="count-badge {badge_class}">{badge_label}</span></summary>
+<p class="muted">Tail-N-minutes parse of host audit/auth/web logs. PII (passwords, tokens, JWTs, certs, emails) is scrubbed before rendering.</p>
+{''.join(src_html)}
+</details>
+</section>
+"""
+
+
+def _render_persistence_section(findings):
+    """Render persistence-enumeration findings (F-4). When `--hash-tasks` is
+    enabled, each row also carries SHA-256 of the binary the entry calls,
+    rendered as a click-to-VirusTotal link, and (if --vt-api-key was passed)
+    VT verdict counts."""
+    if not findings:
+        return ('<section id="section-persistence">'
+                '<div class="empty-state">'
+                '<strong>Persistence mechanisms:</strong> not enumerated '
+                '(pass <code>--persistence</code> to scan cron, systemd, '
+                'scheduled tasks, registry Run keys, launchd, SSH keys).'
+                '</div></section>')
+    recent_count = sum(1 for f in findings if f.get("recent"))
+    has_hashes = any(f.get("binary_hash") for f in findings)
+    rows = []
+    for f in findings[:500]:
+        sev_class = "HIGH" if f.get("recent") else "LOW"
+        # VT-malicious row gets HIGH regardless of mtime.
+        vt = f.get("vt") or {}
+        if vt.get("found") and vt.get("malicious", 0) > 0:
+            sev_class = "HIGH"
+        kind = f.get("kind", "?")
+        name = f.get("name", "")
+        path = f.get("path", "")
+        cmd = f.get("command", "")
+        mtime = f.get("mtime")
+        mtime_str = (datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                     if mtime else "—")
+        # v1.3 --hash-tasks columns
+        hash_cell = ""
+        vt_cell = ""
+        if has_hashes:
+            bh = f.get("binary_hash") or ""
+            bp = f.get("binary_path") or ""
+            if VirusTotalClient._is_valid_sha256(bh):
+                href = f"https://www.virustotal.com/gui/file/{urllib.parse.quote(bh, safe='')}"
+                hash_cell = (
+                    f'<a class="hash" target="_blank" rel="noopener noreferrer" '
+                    f'href="{html_mod.escape(href, quote=True)}" '
+                    f'title="{html_mod.escape(bp)}">{html_mod.escape(bh[:16])}…</a>'
+                )
+            elif bh in ("NOT_FOUND", "ACCESS_DENIED", "TOO_LARGE", "N/A"):
+                hash_cell = f'<span class="muted">{html_mod.escape(bh)}</span>'
+            elif bh:
+                hash_cell = f'<span class="muted">{html_mod.escape(bh[:16])}…</span>'
+            else:
+                hash_cell = '<span class="muted">—</span>'
+            if vt.get("found"):
+                mal = vt.get("malicious", 0)
+                sus = vt.get("suspicious", 0)
+                if mal > 0:
+                    vt_cell = f'<span class="vt-mal">{mal} mal</span> / {sus} sus'
+                elif sus > 0:
+                    vt_cell = f'<span class="vt-mal">{sus} sus</span>'
+                else:
+                    vt_cell = '<span class="vt-clean">clean</span>'
+            else:
+                vt_cell = '<span class="muted">—</span>'
+        extra_cols = (f'<td>{hash_cell}</td><td>{vt_cell}</td>'
+                      if has_hashes else "")
+        rows.append(
+            f'<tr><td><span class="risk {sev_class}">{html_mod.escape(kind.upper())}</span></td>'
+            f'<td>{html_mod.escape(name)}</td>'
+            f'<td class="path">{html_mod.escape(path)}</td>'
+            f'<td class="path">{html_mod.escape(cmd)}</td>'
+            f'<td>{mtime_str}{" ⚡" if f.get("recent") else ""}</td>'
+            f'{extra_cols}</tr>'
+        )
+    extra_headers = ("<th>Binary SHA-256</th><th>VT</th>"
+                     if has_hashes else "")
+    hash_blurb = (" Hashes are clickable VirusTotal links — no API key needed for "
+                  "the redirect; pass --vt-api-key for inline verdict counts."
+                  if has_hashes else "")
+    badge_cls = "has-hi" if recent_count else ("ok" if findings else "warn")
+    badge_text = (f"{recent_count} recent" if recent_count
+                  else f"{len(findings)} entries")
+    return f"""
+<section id="section-persistence">
+<details{' open' if recent_count else ''} id="persistence-details">
+<summary>Persistence mechanisms<span class="count-badge {badge_cls}">{badge_text}</span></summary>
+<p class="muted">Cron, systemd, scheduled tasks, registry Run keys, launchd, SSH authorized_keys.
+The ⚡ marker indicates files modified within the last {PersistenceScanner.RECENT_DAYS} days — these are the IoCs worth investigating first.{hash_blurb}</p>
+<table class='log-table'>
+<thead><tr><th>Kind</th><th>Name</th><th>Path</th><th>Command</th><th>Modified</th>{extra_headers}</tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+</details>
+</section>
+"""
+
+
+def _render_webshell_section(findings):
+    """Render web-shell content-scan findings (F-2.3)."""
+    if not findings:
+        return ('<section id="section-webshell">'
+                '<div class="empty-state">'
+                '<strong>Web shells:</strong> clean (no webroot scan performed, '
+                'or 0 matches). Pass <code>--scan-webroots</code> to walk '
+                'webroots looking for shell signatures.'
+                '</div></section>')
+    rows = []
+    for f in findings:
+        mtime = f.get("mtime")
+        mtime_str = (datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                     if mtime else "—")
+        flags = ", ".join(f.get("flags") or [])
+        rows.append(
+            f'<tr><td class="path">{html_mod.escape(f.get("path", ""))}</td>'
+            f'<td>{f.get("size", 0):,}</td>'
+            f'<td>{mtime_str}</td>'
+            f'<td class="flags">{html_mod.escape(flags)}</td></tr>'
+        )
+    return f"""
+<section id="section-webshell">
+<details open id="webshell-details">
+<summary>⚠ Web-shell content findings<span class="count-badge has-hi">{len(findings)} hits</span></summary>
+<p class="muted">Files matching known web-shell signatures (Weevely, China Chopper, eval/base64 patterns).
+This is a content-only signal — investigate each file before deletion (may be a planted backdoor; may be operator-installed admin shell; may be a false positive).</p>
+<table class='log-table'>
+<thead><tr><th>Path</th><th>Size</th><th>Modified</th><th>Signatures matched</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+</details>
+</section>
+"""
+
+
+def _fmt_bytes_compact(n):
+    """Compact bytes formatter for the HTML Pkts column: '850 B', '4.2 KB',
+    '1.1 MB'. Returns '—' for 0 / None."""
+    if not n:
+        return "—"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
 def render_html(conn_history, args, flow, output_path, console,
-                dns_findings=None, saved_pcap_path=None):
+                dns_findings=None, saved_pcap_path=None,
+                log_findings=None, persistence_findings=None,
+                webshell_findings=None, log_sources_skipped=None):
     rows_html = []
     risk_order = {"HIGH": 0, "MED": 1, "LOW": 2}
     sorted_conns = sorted(conn_history.values(), key=lambda x: (risk_order.get(x["risk"], 9), x["app"]))
+
+    # v1.3 UX: build a per-local-port packet-statistics index from the saved
+    # pcap so each connection row can show "N pkts / B bytes" up-front. Lets
+    # the operator see at a glance which rows have actual captured traffic
+    # without having to click "Load packets" first. The packet_previews list
+    # only contains TCP packets WITH payload (pure ACKs are excluded), so the
+    # bytes here represent real application data — not link-layer overhead.
+    port_pkt_stats = {}
+    if flow is not None:
+        for p in getattr(flow, "packet_previews", []):
+            for endpoint in (p.get("src", ""), p.get("dst", "")):
+                colon = endpoint.rfind(":")
+                if colon < 0:
+                    continue
+                try:
+                    port = int(endpoint[colon + 1:])
+                except ValueError:
+                    continue
+                count, total = port_pkt_stats.get(port, (0, 0))
+                port_pkt_stats[port] = (count + 1, total + int(p.get("size", 0) or 0))
+    has_packet_data = bool(port_pkt_stats)
     high = sum(1 for c in sorted_conns if c["risk"] == "HIGH")
     med = sum(1 for c in sorted_conns if c["risk"] == "MED")
     low = sum(1 for c in sorted_conns if c["risk"] == "LOW")
@@ -2907,6 +6517,11 @@ def render_html(conn_history, args, flow, output_path, console,
         row_class_set = [c["risk"]]
         if _is_noisy_microsoft_or_system(c):
             row_class_set.append("noisy")
+        # v1.3: rows owned by netmon (this script + its child processes) are
+        # tagged cat-netmon-self and hidden by default. The "Show netmon-
+        # generated events" toggle in the HTML reveals them.
+        if c.get("is_netmon_self"):
+            row_class_set.append("cat-netmon-self")
         if _is_unsigned_binary(c):
             row_class_set.append("cat-unsigned")
         if c.get("is_tor"):
@@ -2946,15 +6561,108 @@ def render_html(conn_history, args, flow, output_path, console,
         row_class_set.append(_STATUS_GROUPS.get(status_raw, "status-other"))
         row_classes = " ".join(row_class_set)
 
+        # v1.3 — Direction (T1-2), Age (T3-1), Service (T2-2) columns
+        direction = c.get("direction") or ""
+        dir_glyph = {
+            "OUTBOUND": "↑ OUT",
+            "INBOUND":  "↓ IN",
+            "LOOPBACK": "↔ LOOP",
+            "LISTEN":   "○ LSTN",
+            "AMBIGUOUS": "?",
+        }.get(direction, html_mod.escape(direction))
+        dir_class = {
+            "OUTBOUND": "dir-out", "INBOUND": "dir-in",
+            "LOOPBACK": "dir-loop", "LISTEN": "dir-listen",
+        }.get(direction, "")
+
+        age = c.get("session_age_s")
+        if age is None:
+            age_html = '<span class="muted">—</span>'
+        else:
+            age_html = _fmt_age(age)
+
+        service = c.get("systemd_unit") or ""
+        if service:
+            service_html = f'<span class="muted">{html_mod.escape(service)}</span>'
+        else:
+            service_html = '<span class="muted">—</span>'
+
+        # T2-1: CrowdSec verdict pill, embedded next to the remote.
+        cs_verdict = c.get("crowdsec")
+        if cs_verdict == "ban":
+            remote_html += ' <span class="vt-mal">[CS:BAN]</span>'
+        elif cs_verdict in ("captcha", "throttle"):
+            remote_html += f' <span class="sig signed">[CS:{cs_verdict.upper()}]</span>'
+        elif cs_verdict == "clean":
+            remote_html += ' <span class="sig trusted">[CS:OK]</span>'
+
+        # T2-3: Firewall verdict pill on the local cell (listener allow/deny).
+        fw_verdict = c.get("firewall")
+        if fw_verdict == "blocked":
+            local_html += '<br><span class="sig trusted">fw: blocked</span>'
+        elif fw_verdict == "lan-only":
+            local_html += '<br><span class="sig signed">fw: LAN only</span>'
+        elif fw_verdict == "allowed":
+            local_html += '<br><span class="muted">fw: allowed</span>'
+
+        # v1.3 bug fix — emit the local port as a row-level data attribute so
+        # the Load-Packets JS can read it directly. Previously the JS parsed
+        # cells[4].textContent.lastIndexOf(':'), which broke once we started
+        # appending "fw: allowed/blocked/LAN only" annotations into the same
+        # cell (the parser would lock onto the colon in "fw:" and produce an
+        # empty port set, so per-process packet filtering returned 0 matches).
+        row_attrs = []
+        lport = SecurityMonitor._local_port(c.get("local") or "")
+        if lport is not None:
+            row_attrs.append(f'data-local-port="{lport}"')
+
+        # v1.3 UX: per-row packet stats (count + bytes) AND a tooltip on the
+        # process cell so the operator sees BEFORE clicking which rows have
+        # actual captured traffic. Computed from the per-port stats built
+        # above; rows with zero captured payload show "—" so analysts don't
+        # waste time on Load-Packets clicks that return nothing.
+        pkt_count, pkt_bytes = (0, 0)
+        if lport is not None and lport in port_pkt_stats:
+            pkt_count, pkt_bytes = port_pkt_stats[lport]
+        row_attrs.append(f'data-pkt-count="{pkt_count}"')
+        row_attrs.append(f'data-pkt-bytes="{pkt_bytes}"')
+        if has_packet_data:
+            if pkt_count:
+                pkts_html = (f'<span title="{pkt_count} packets, '
+                             f'{pkt_bytes} bytes total">'
+                             f'{pkt_count} · {_fmt_bytes_compact(pkt_bytes)}'
+                             f'</span>')
+                proc_title = (f'{pkt_count} captured packets · '
+                              f'{_fmt_bytes_compact(pkt_bytes)} payload')
+            else:
+                pkts_html = '<span class="muted" title="No payload packets captured for this socket. Pure ACKs are not stored.">—</span>'
+                proc_title = "No captured payload packets for this socket"
+            pkts_cell = f'<td class="pkts" data-sort="{pkt_count}">{pkts_html}</td>'
+        else:
+            pkts_cell = ""
+            proc_title = ""
+
+        proc_html = html_mod.escape(c["app"] or "")
+        if proc_title:
+            proc_span = f'<span class="proc-link" title="{html_mod.escape(proc_title)}">{proc_html}</span>'
+        else:
+            proc_span = f'<span class="proc-link">{proc_html}</span>'
+
+        row_attr_str = (" " + " ".join(row_attrs)) if row_attrs else ""
         rows_html.append(
-            f'<tr class="{row_classes}">'
+            f'<tr class="{row_classes}"{row_attr_str}>'
+            f'<td class="row-num"></td>'                                # NEW: filled by JS
             f'<td><span class="risk {c["risk"]}">{c["risk"]}</span></td>'
-            f'<td><span class="proc-link">{html_mod.escape(c["app"] or "")}</span></td>'
+            f'<td>{proc_span}</td>'
             f'<td>{c["pid"] or ""}</td>'
             f'<td class="sig {sig_class}">{html_mod.escape(sig_text)}</td>'
             f'<td class="local">{local_html}</td>'
             f'<td>{remote_html}</td>'
+            f'<td class="dir {dir_class}">{dir_glyph}</td>'
             f'<td>{geo}</td>'
+            f'<td class="age">{age_html}</td>'
+            f'{pkts_cell}'                                              # NEW: conditional
+            f'<td>{service_html}</td>'
             f'<td class="path">{path_html}</td>'
             f'<td>{vt_html}</td>'
             f'<td class="flags">{html_mod.escape(flags)}</td>'
@@ -2970,6 +6678,23 @@ def render_html(conn_history, args, flow, output_path, console,
     else:
         noise_toggle = ""
 
+    # === v1.3: netmon-self toggle ===
+    # Count connections owned by netmon itself. These are tagged
+    # cat-netmon-self in the row classes and hidden by default via CSS.
+    netmon_self_count = sum(
+        1 for c in sorted_conns if c.get("is_netmon_self"))
+    if netmon_self_count:
+        netmon_self_toggle = (
+            f'<label class="toggle" title="Connections owned by this netmon '
+            f'run or its child processes (pktmon / PowerShell sig-verifier / '
+            f'etc.). Hidden by default so the report shows external activity, '
+            f'not the monitor\'s own footprint."><input type="checkbox" '
+            f'id="show-netmon"> Show netmon-generated events '
+            f'({netmon_self_count} hidden)</label>'
+        )
+    else:
+        netmon_self_toggle = ""
+
     # === Packet capture summary ===
     capture_section = ""
     if flow:
@@ -2981,9 +6706,14 @@ def render_html(conn_history, args, flow, output_path, console,
             for name, count in top_dns
         ) or "<tr><td colspan='2' class='muted'>(no DNS queries captured)</td></tr>"
         sni_html = ", ".join(html_mod.escape(s) for s in top_sni) or "<span class='muted'>(none)</span>"
+        # Total bytes badge — quickly tells the analyst how much traffic
+        # was captured (helps spot "5 MB exfil" patterns).
+        cap_badge = (f"{s['unique_dns_names']} DNS + "
+                     f"{s['unique_sni_names']} TLS hosts")
         capture_section = f"""
-<details open>
-<summary>Packet capture summary ({s['unique_dns_names']} DNS names, {s['unique_sni_names']} TLS hosts)</summary>
+<section id="section-capture">
+<details open id="capture-details">
+<summary>Packet capture summary<span class="count-badge ok">{cap_badge}</span></summary>
 <div class="kv">
   <span class="k">DNS queries</span><span>{s['dns_query_count']}</span>
   <span class="k">Unique DNS names</span><span>{s['unique_dns_names']}</span>
@@ -2996,6 +6726,7 @@ def render_html(conn_history, args, flow, output_path, console,
 <h3 style="margin-top:16px">TLS SNI hosts</h3>
 <div>{sni_html}</div>
 </details>
+</section>
 """
 
     # === DNS heuristic findings ===
@@ -3012,14 +6743,21 @@ def render_html(conn_history, args, flow, output_path, console,
             f'</tr>'
             for r in dns_findings[:50]
         )
+        # Severity badge: NXDOMAIN-burst flags are HIGH (probable beacon),
+        # plain HIGH_RETRY is informational.
+        has_nx = any("NXDOMAIN" in fl for r in dns_findings
+                     for fl in (r.get("flags") or []))
+        dns_badge_cls = "has-hi" if has_nx else "warn"
         dns_section = f"""
-<details open>
-<summary>Suspicious DNS findings ({len(dns_findings)} flagged names)</summary>
+<section id="section-dns">
+<details open id="dns-details">
+<summary>Suspicious DNS findings<span class="count-badge {dns_badge_cls}">{len(dns_findings)} flagged</span></summary>
 <table>
   <thead><tr><th>Domain</th><th>Queries</th><th>Flags</th></tr></thead>
   <tbody>{dns_rows_html}</tbody>
 </table>
 </details>
+</section>
 """
 
     # === Browsable packet log (only when --save-capture was used) ===
@@ -3135,6 +6873,69 @@ def render_html(conn_history, args, flow, output_path, console,
 
     host_os = "Windows" if is_windows else ("Linux" if sys.platform.startswith("linux") else sys.platform)
 
+    # === v1.3 — Host event log review (F-3) ===
+    log_section = _render_log_section(log_findings, log_sources_skipped)
+    # === v1.3 — Persistence enumeration (F-4) ===
+    persistence_section = _render_persistence_section(persistence_findings)
+    # === v1.3 — Web-shell scan findings (F-2.3) ===
+    webshell_section = _render_webshell_section(webshell_findings)
+
+    # === v1.3 UX: sticky table-of-contents nav ===
+    # The HTML report has 5-7 major sections plus the connection table.
+    # Without a quick-nav the analyst has to scroll past 100+ rows to reach
+    # the persistence or log sections. The TOC pins to the top and badges
+    # each section with its finding count (red if HIGH-severity exists).
+    log_hi = sum(1 for e in (log_findings or [])
+                 if e.get("severity") == "HIGH")
+    log_total = len(log_findings or [])
+    pers_recent = sum(1 for p in (persistence_findings or []) if p.get("recent"))
+    pers_total = len(persistence_findings or [])
+    ws_total = len(webshell_findings or [])
+    dns_total = len(dns_findings or [])
+    capture_present = flow is not None and getattr(flow, "packet_previews", [])
+
+    def _toc_link(href, label, count, hi):
+        cls = "has-hi" if hi else ""
+        badge_cls = "warn" if (count and not hi) else ""
+        if count:
+            badge = f'<span class="badge {badge_cls}">{count}</span>'
+        else:
+            badge = '<span class="badge">0</span>'
+        return f'<a href="{href}" class="{cls}">{label}{badge}</a>'
+
+    high_count_total = sum(1 for c in conn_history.values() if c["risk"] == "HIGH")
+    toc_links = [
+        _toc_link("#section-connections", "Connections ",
+                  len(conn_history), high_count_total > 0),
+    ]
+    if capture_present or dns_total:
+        toc_links.append(_toc_link("#section-capture", "Capture ",
+                                   1 if capture_present else 0, False))
+    if dns_total:
+        toc_links.append(_toc_link("#section-dns", "DNS findings ",
+                                   dns_total, False))
+    toc_links.append(_toc_link("#section-logs", "Event logs ",
+                               log_total, log_hi > 0))
+    toc_links.append(_toc_link("#section-persistence", "Persistence ",
+                               pers_total, pers_recent > 0))
+    toc_links.append(_toc_link("#section-webshell", "Web shells ",
+                               ws_total, ws_total > 0))
+    toc_html = (
+        '<nav class="toc" id="section-nav">'
+        '<span class="toc-label">Jump to:</span>'
+        + "".join(toc_links)
+        + '</nav>'
+    )
+
+    # v1.3 UX: the Pkts column header only shows when capture data is present;
+    # the corresponding <td> cells are empty when has_packet_data is False
+    # (see the row-builder loop above), but the template still needs SOME
+    # substitution value for $pkts_th — empty string when absent.
+    pkts_th = ('<th data-sort="pkts" title="Captured packets and total payload '
+               'bytes for this connection during the capture window. — means '
+               'no payload packets were stored for this socket.">Pkts</th>'
+               if has_packet_data else "")
+
     html_out = HTML_TEMPLATE.substitute(
         generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         duration=args.time,
@@ -3143,10 +6944,16 @@ def render_html(conn_history, args, flow, output_path, console,
         procs=procs, peers=peers, unsigned=unsigned, tor=tor, vt_mal=vt_mal,
         exposed_any=exposed_any, exposed_lan=exposed_lan,
         rows="\n".join(rows_html),
+        pkts_th=pkts_th,
         capture_section=capture_section,
         dns_section=dns_section,
         packet_log_section=packet_log_section,
+        log_section=log_section,
+        persistence_section=persistence_section,
+        webshell_section=webshell_section,
         noise_toggle=noise_toggle,
+        netmon_self_toggle=netmon_self_toggle,
+        toc_html=toc_html,
         body_class="",
         host_os=html_mod.escape(host_os),
         version=VERSION,
@@ -3216,18 +7023,29 @@ def _build_arg_parser():
                         help="CSV machine-readable export. OFF by default. Pass --csv (no value) to "
                              "auto-generate ./reports/netmon-<YYYYMMDD-HHMMSS>.csv, or pass a path.",
                         dest="output")
-    parser.add_argument("--capture", action="store_true",
-                        help="Also capture packets via pktmon (Windows) / tcpdump (Linux). Requires admin/root.")
+    # v1.3 capture CLI rework (T2-5):
+    #   --capture [PATH]   capture AND save (the common case is the default)
+    #   --capture-fly      capture, parse, discard the pcap (ephemeral)
+    #   --save-capture     v1.2 alias for --capture, kept for backward compat
+    parser.add_argument("--capture", default=None, nargs="?", const="__AUTO__",
+                        metavar="PATH",
+                        help="Capture packets (pktmon on Windows, tcpdump on Linux/macOS) "
+                             "AND save the .pcap. Default destination: "
+                             "./reports/netmon-<YYYYMMDD-HHMMSS>.pcap. Pass an explicit path "
+                             "to override. Requires admin/root. WARNING: captures can be tens-"
+                             "hundreds of MB; you'll be prompted unless --yes is given. New in "
+                             "v1.3: was previously ephemeral by default — now saves by default.")
+    parser.add_argument("--capture-fly", action="store_true",
+                        help="Capture, parse, and DISCARD the pcap at the end. Use when you "
+                             "only need the HTML's DNS/TLS/HTTP/TCP-flow metadata views and "
+                             "don't want a pcap on disk (read-only / CI). Skips the disk-usage "
+                             "prompt. Mutually exclusive with --capture.")
     parser.add_argument("--save-capture", default=None, nargs="?", const="__AUTO__",
                         metavar="PATH",
-                        help="Save the raw pcap AND embed a browsable packet log "
-                             "(DNS queries, TLS handshakes, TCP flows) in the HTML report. "
-                             "Implies --capture. PATH is optional — bare --save-capture "
-                             "auto-generates 'netmon-capture-<YYYYMMDD-HHMMSS>.pcap' in the "
-                             "current directory. WARNING: pcaps can be large (tens-hundreds "
-                             "of MB); you'll be prompted to confirm unless --yes is given.")
+                        help="DEPRECATED v1.2 alias for --capture; prints a deprecation note. "
+                             "Will be removed in v2.0.")
     parser.add_argument("--yes", action="store_true",
-                        help="Auto-confirm prompts (e.g. for --save-capture disk-usage warning). "
+                        help="Auto-confirm prompts (e.g. for --capture disk-usage warning). "
                              "Use for non-interactive / scripted runs.")
     parser.add_argument("--vt-api-key", default=os.environ.get("VT_API_KEY"),
                         help="VirusTotal API key. Prefer $VT_API_KEY env var — passing on CLI exposes "
@@ -3240,10 +7058,128 @@ def _build_arg_parser():
                              "produces a noisy warning otherwise. Enable when you actually want "
                              "Tor-exit detection.")
     parser.add_argument("--no-signing", action="store_true",
-                        help="Skip Authenticode signature verification")
+                        help="Skip Authenticode / package signature verification")
+    parser.add_argument("--crowdsec-token", default=os.environ.get("CROWDSEC_LAPI_KEY"),
+                        help="CrowdSec Local API token. If omitted, netmon auto-detects from "
+                             "/etc/crowdsec/local_api_credentials.yaml when running as root. "
+                             "Prefer $CROWDSEC_LAPI_KEY env var over CLI flag.")
+    parser.add_argument("--no-crowdsec", action="store_true",
+                        help="Skip CrowdSec lookups even if a local LAPI is running.")
+    parser.add_argument("--no-firewall", action="store_true",
+                        help="Skip the firewall-state snapshot (ufw / nft / iptables / "
+                             "Windows Firewall profile).")
+    parser.add_argument("--full-triage", "--tr", action="store_true",
+                        help="Convenience: enable a complete one-shot triage in a single "
+                             "flag. Equivalent to: -t 30 --capture --yes --persistence "
+                             "--hash-tasks --scan-webroots --logs 3. Any explicit flag "
+                             "you also pass overrides its full-triage default (e.g. "
+                             "'--full-triage -t 60 --logs 10' runs for 60s with 10-min "
+                             "log review). Does NOT auto-enable Tor scanning or JSON "
+                             "output — pass --scan-tor / --json explicitly if wanted. "
+                             "VirusTotal still honors $VT_API_KEY env var if set.")
+    # === v1.3 host-context features ===
+    parser.add_argument("--logs", type=int, default=None, metavar="MINUTES",
+                        help="Review host event logs for the last N minutes (1-1440). "
+                             "Linux: /var/log/auth, syslog, apache/nginx, mysql, audit, "
+                             "fail2ban, crowdsec. Windows: Security / System / PowerShell "
+                             "Operational / Defender event logs. Findings render in a new "
+                             "HTML section with brute-force / privesc / web-shell rules. "
+                             "PII (passwords, tokens, JWTs, certs, emails) is scrubbed.")
+    parser.add_argument("--persistence", action="store_true",
+                        help="Enumerate host persistence mechanisms (cron, systemd unit "
+                             "files, registry Run keys, Windows scheduled tasks + services, "
+                             "macOS launchd, SSH authorized_keys). Recently-modified "
+                             "entries are flagged as IoCs.")
+    parser.add_argument("--hash-tasks", action="store_true",
+                        help="For every persistence entry (cron job, systemd unit, "
+                             "scheduled task, registry Run key, service, launchd plist), "
+                             "extract the binary path from the command, compute its SHA-256, "
+                             "and (when --vt-api-key is set) look up VirusTotal verdicts. "
+                             "Implies --persistence. Adds binary_hash + VT columns to the "
+                             "HTML / JSON output. The HTML hash becomes a clickable link to "
+                             "https://www.virustotal.com/gui/file/<sha256> so analysts can "
+                             "triage in one click even without an API key.")
+    parser.add_argument("--scan-webroots", action="store_true",
+                        help="Scan common webroot directories for web-shell content "
+                             "signatures (Weevely, China Chopper, eval/base64 patterns "
+                             "for PHP/ASP/JSP). Bounded; ~1s on typical hosts.")
+    parser.add_argument("--webroots", default=None,
+                        help="Comma-separated list of webroot directories to scan (overrides "
+                             "the bundled DEFAULT_WEBROOTS list when --scan-webroots is set).")
+    parser.add_argument("--json", default=None, nargs="?", const="__AUTO__",
+                        metavar="PATH",
+                        help="Write machine-readable JSON output. Pass --json with no value "
+                             "to auto-generate ./reports/netmon-<TS>.json. Includes every "
+                             "connection field plus log findings, persistence, webshell "
+                             "results. Suitable for SIEM ingestion.")
+    parser.add_argument("--ndjson", default=None, nargs="?", const="__AUTO__",
+                        metavar="PATH",
+                        help="Write newline-delimited JSON (one object per connection per "
+                             "line). Suitable for streaming into Splunk / ELK / Loki.")
+    parser.add_argument("--diff", default=None, nargs=2,
+                        metavar=("OLD.json", "NEW.json"),
+                        help="Compare two previous --json runs. Reports new flows, gone "
+                             "flows, and risk-class transitions. Writes a dedicated diff "
+                             "HTML report. When --diff is given, no live monitoring runs.")
+    # --alert-webhook is intentionally undocumented (help=SUPPRESS). It POSTs
+    # a JSON summary of HIGH findings to the URL — useful for SIEM ingest
+    # or operator alerting, but kept off the --help surface to avoid
+    # encouraging casual users to ship findings off-host. Anyone reviewing
+    # the source can still use it via $NETMON_WEBHOOK or the CLI flag.
+    parser.add_argument("--alert-webhook", default=os.environ.get("NETMON_WEBHOOK"),
+                        metavar="URL", help=argparse.SUPPRESS)
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase logging verbosity (-v info, -vv debug)")
     return parser
+
+
+def _apply_full_triage_defaults(args, console):
+    """Apply --full-triage / --tr implied defaults onto args.
+
+    Only fills fields that are STILL at their argparse default — so explicit
+    flags the operator also passed (e.g. -t 60, --logs 10) win over the
+    triage preset. Returns the (possibly mutated) args.
+
+    Set:  -t 30, --capture, --yes, --persistence, --hash-tasks,
+          --scan-webroots, --logs 3
+    Not set:  --scan-tor, --json, --ndjson, --alert-webhook
+    """
+    if not getattr(args, "full_triage", False):
+        return args
+    activated = []
+    # -t 30 only if user didn't pass an explicit duration. argparse default
+    # for --time is 15, so we treat 15 as "still default".
+    if args.time == 15:
+        args.time = 30
+        activated.append("-t 30")
+    # --capture (and --yes) — only if no capture flag was already set.
+    if args.capture is None and not getattr(args, "capture_fly", False) \
+            and getattr(args, "save_capture", None) is None:
+        args.capture = "__AUTO__"
+        activated.append("--capture --yes")
+    args.yes = True
+    # --persistence
+    if not args.persistence:
+        args.persistence = True
+        activated.append("--persistence")
+    # --hash-tasks
+    if not args.hash_tasks:
+        args.hash_tasks = True
+        activated.append("--hash-tasks")
+    # --scan-webroots
+    if not args.scan_webroots:
+        args.scan_webroots = True
+        activated.append("--scan-webroots")
+    # --logs 3 — only if user didn't pass --logs N explicitly.
+    if args.logs is None:
+        args.logs = 3
+        activated.append("--logs 3")
+    # Console heads-up so the operator sees what was implied.
+    console.print(
+        "[bold cyan]--full-triage active.[/bold cyan] "
+        "Activated: " + ", ".join(activated)
+    )
+    return args
 
 
 def _resolve_default_paths(args, console):
@@ -3256,17 +7192,40 @@ def _resolve_default_paths(args, console):
     Tries `./reports/` first; falls back to the system tempdir if the project
     directory is not writable. Sets mode 0700 on the directory on POSIX so
     other local users can't read your captures.
+
+    v1.3 (T2-5): merges the legacy --save-capture into --capture. --capture
+    now both captures AND saves by default; --capture-fly is the new ephemeral
+    mode. Internally we normalize to:
+      args.capture_path = path or None (None = no capture)
+      args.capture_save = True if the pcap should be persisted
     """
     # Apply --no-html / --no-text negators before resolving paths.
     if getattr(args, "no_html", False):
         args.html = None
     if getattr(args, "no_text", False):
         args.text = None
+
+    # Normalize the new --capture / --capture-fly / legacy --save-capture
+    # triplet into a single internal pair (capture_path, capture_save).
+    capture_arg = getattr(args, "capture", None)
+    capture_fly = getattr(args, "capture_fly", False)
+    save_capture = getattr(args, "save_capture", None)
+
+    if capture_fly and (capture_arg is not None or save_capture is not None):
+        console.print("[yellow]warning:[/yellow] --capture-fly was passed alongside "
+                      "--capture/--save-capture; --capture-fly wins (no pcap will be saved).")
+    if save_capture is not None and capture_arg is None and not capture_fly:
+        console.print("[dim]note: --save-capture is a deprecated alias for --capture "
+                      "(unchanged behavior). It will be removed in v2.0.[/dim]")
+        capture_arg = save_capture
+
     needs_default_dir = (
         args.output == "__AUTO__"
         or args.html == "__AUTO__"
         or getattr(args, "text", None) == "__AUTO__"
-        or args.save_capture == "__AUTO__"
+        or capture_arg == "__AUTO__"
+        or getattr(args, "json", None) == "__AUTO__"
+        or getattr(args, "ndjson", None) == "__AUTO__"
     )
     output_dir = None
     if needs_default_dir:
@@ -3307,8 +7266,41 @@ def _resolve_default_paths(args, console):
         args.html = str(output_dir / f"netmon-{ts}.html")
     if getattr(args, "text", None) == "__AUTO__":
         args.text = str(output_dir / f"netmon-{ts}.txt")
-    if args.save_capture == "__AUTO__":
-        args.save_capture = str(output_dir / f"netmon-{ts}.pcap")
+    if getattr(args, "json", None) == "__AUTO__":
+        args.json = str(output_dir / f"netmon-{ts}.json")
+    if getattr(args, "ndjson", None) == "__AUTO__":
+        args.ndjson = str(output_dir / f"netmon-{ts}.ndjson")
+    # Normalize --webroots into a list for the scanner
+    raw_webroots = getattr(args, "webroots", None)
+    if raw_webroots:
+        args.webroots = [p.strip() for p in raw_webroots.split(",") if p.strip()]
+
+    # Resolve the capture path and the save flag in one pass. After this:
+    #   args.capture_path → resolved pcap path (or None if no capture)
+    #   args.capture_save → True if pcap should be persisted
+    if capture_fly:
+        args.capture_path = None  # we still capture, but to a temp dir only
+        args.capture_save = False
+        # Keep the public flag set so SecurityMonitor knows capture is on
+        args.capture = "__FLY__"
+    elif capture_arg == "__AUTO__":
+        args.capture_path = str(output_dir / f"netmon-{ts}.pcap")
+        args.capture_save = True
+        args.capture = args.capture_path
+    elif capture_arg:
+        args.capture_path = capture_arg
+        args.capture_save = True
+        args.capture = capture_arg
+    else:
+        args.capture_path = None
+        args.capture_save = False
+        args.capture = None
+    # Back-compat: keep save_capture populated when a save IS happening, so
+    # any external code reading args.save_capture sees the same value as v1.2.
+    if args.capture_save:
+        args.save_capture = args.capture_path
+    else:
+        args.save_capture = None
     return args
 
 
@@ -3338,7 +7330,7 @@ def _validate_args(args, console):
     if args.time < 1 or args.time > 86400:
         console.print("[bold red]error:[/bold red] --time must be between 1 and 86400 seconds")
         return EXIT_USAGE
-    for path_attr in ("output", "html", "save_capture"):
+    for path_attr in ("output", "html", "capture_path"):
         p = getattr(args, path_attr, None)
         if p:
             try:
@@ -3351,11 +7343,11 @@ def _validate_args(args, console):
                 console.print(f"[bold red]error:[/bold red] invalid --{path_attr.replace('_', '-')} "
                               f"path: {e}")
                 return EXIT_USAGE
-    # --save-capture implies --capture, but only after confirmation.
-    if args.save_capture:
-        if not _confirm_save_capture(args.save_capture, console, args.yes):
+    # --capture saves by default now (T2-5); confirm before persisting.
+    # --capture-fly is exempt because nothing is written to disk.
+    if getattr(args, "capture_save", False) and args.capture_path:
+        if not _confirm_save_capture(args.capture_path, console, args.yes):
             return EXIT_USAGE
-        args.capture = True
     if args.vt_api_key and len(args.vt_api_key) < 32:
         console.print("[yellow]warning:[/yellow] --vt-api-key looks too short to be a real "
                       "VirusTotal key; lookups will likely fail.")
@@ -3384,9 +7376,18 @@ def main(argv=None):
 
     console = Console()
 
-    # Resolve auto paths (--output / --html / --save-capture) into timestamped
-    # filenames inside ./reports/ so reruns don't overwrite each other and
-    # the HTML report links to its own pcap.
+    # v1.3 F-6.3: --diff old.json new.json — short-circuit; no live monitoring.
+    if getattr(args, "diff", None):
+        return _run_diff_mode(args, console)
+
+    # v1.3 convenience: --full-triage / --tr expands into the canonical
+    # multi-flag triage set. Applied BEFORE _resolve_default_paths so the
+    # auto-path machinery resolves capture/log/etc. paths properly.
+    args = _apply_full_triage_defaults(args, console)
+
+    # Resolve auto paths (--output / --html / --save-capture / --json) into
+    # timestamped filenames inside ./reports/ so reruns don't overwrite each
+    # other and the HTML report links to its own pcap.
     args = _resolve_default_paths(args, console)
 
     rc = _validate_args(args, console)
@@ -3422,6 +7423,10 @@ def main(argv=None):
             history, args, monitor.flow, args.html, console,
             dns_findings=getattr(monitor, "dns_findings", None),
             saved_pcap_path=getattr(monitor, "saved_pcap_path", None),
+            log_findings=getattr(monitor, "log_findings", None),
+            persistence_findings=getattr(monitor, "persistence_findings", None),
+            webshell_findings=getattr(monitor, "webshell_findings", None),
+            log_sources_skipped=getattr(monitor, "log_sources_skipped", None),
         )
     if getattr(args, "text", None):
         export_text(
@@ -3432,6 +7437,21 @@ def main(argv=None):
         )
     if args.output:
         export_csv(history, args.output, console)
+    if getattr(args, "json", None):
+        export_json(history, monitor, args.json, console)
+    if getattr(args, "ndjson", None):
+        export_ndjson(history, args.ndjson, console)
+
+    # v1.3 F-9.1: webhook alert (HIGH findings only). Failure never blocks.
+    if getattr(args, "alert_webhook", None):
+        send_webhook_alerts(
+            args.alert_webhook,
+            history,
+            log_findings=getattr(monitor, "log_findings", None),
+            persistence=getattr(monitor, "persistence_findings", None),
+            webshell=getattr(monitor, "webshell_findings", None),
+            console=console,
+        )
 
     # Final summary — show every artifact location so the operator can find
     # the run's outputs without reading scrollback.
@@ -3442,14 +7462,123 @@ def main(argv=None):
         written.append(("TEXT", args.text))
     if args.output:
         written.append(("CSV", args.output))
+    if getattr(args, "json", None):
+        written.append(("JSON", args.json))
+    if getattr(args, "ndjson", None):
+        written.append(("NDJSON", args.ndjson))
     if monitor.saved_pcap_path:
         written.append(("PCAP", monitor.saved_pcap_path))
     if written:
         console.print("\n[bold]Artifacts written:[/bold]")
         for label, path in written:
-            console.print(f"  [cyan]{label:>5}[/cyan]  {path}")
+            console.print(f"  [cyan]{label:>6}[/cyan]  {path}")
 
     return EXIT_OK
+
+
+def _run_diff_mode(args, console):
+    """Diff two prior --json runs and write an HTML diff report.
+    Returns EXIT_OK on success or EXIT_USAGE on file errors."""
+    old_path, new_path = args.diff
+    try:
+        old = load_run_json(old_path)
+        new = load_run_json(new_path)
+    except (OSError, json.JSONDecodeError) as e:
+        console.print(f"[bold red]diff: failed to load input(s):[/bold red] {e}")
+        return EXIT_USAGE
+    result = compute_diff(old, new)
+    out_path = args.html if args.html and args.html != "__AUTO__" else None
+    if not out_path:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = str(Path.cwd() / "reports" / f"netmon-diff-{ts}.html")
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    render_diff_html(result, old, new, out_path, console)
+    console.print(f"[bold green]Diff report:[/bold green] {out_path}")
+    console.print(f"  new flows: {len(result['new_flows'])}")
+    console.print(f"  gone flows: {len(result['gone_flows'])}")
+    console.print(f"  risk transitions: {len(result['risk_transitions'])}")
+    return EXIT_OK
+
+
+def render_diff_html(result, old, new, out_path, console):
+    """Minimal self-contained diff HTML — reuses the main theme's CSS variables."""
+    def _rows(items, kind):
+        out = []
+        for r in items[:500]:
+            if kind == "transition":
+                row = r["row"]
+                out.append(
+                    f"<tr><td>{html_mod.escape(row.get('app') or '')}</td>"
+                    f"<td>{row.get('pid') or ''}</td>"
+                    f"<td>{html_mod.escape(row.get('local') or '')}</td>"
+                    f"<td>{html_mod.escape(row.get('remote') or '')}</td>"
+                    f"<td><span class='risk {r['from']}'>{r['from']}</span> → "
+                    f"<span class='risk {r['to']}'>{r['to']}</span></td>"
+                    f"<td>{html_mod.escape(', '.join(row.get('flags') or []))}</td></tr>"
+                )
+            else:
+                out.append(
+                    f"<tr><td>{html_mod.escape(r.get('app') or '')}</td>"
+                    f"<td>{r.get('pid') or ''}</td>"
+                    f"<td>{html_mod.escape(r.get('local') or '')}</td>"
+                    f"<td>{html_mod.escape(r.get('remote') or '')}</td>"
+                    f"<td><span class='risk {r.get('risk','LOW')}'>{r.get('risk','LOW')}</span></td>"
+                    f"<td>{html_mod.escape(', '.join(r.get('flags') or []))}</td></tr>"
+                )
+        return "".join(out)
+
+    new_rows = _rows(result["new_flows"], "new")
+    gone_rows = _rows(result["gone_flows"], "gone")
+    tx_rows = _rows(result["risk_transitions"], "transition")
+    html_out = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>netmon.py diff</title>
+<style>
+:root {{ --bg:#0e1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9;
+        --muted:#8b949e; --accent:#58a6ff; --red:#f85149; --orange:#d29922; --green:#3fb950; }}
+body {{ background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace,Consolas,monospace;
+       padding:24px; margin:0; }}
+h1 {{ margin:0 0 4px; font-size:20px; }}
+.sub {{ color:var(--muted); margin-bottom:20px; }}
+.stats {{ display:flex; gap:16px; margin-bottom:24px; }}
+.stat {{ background:var(--panel); border:1px solid var(--border); border-radius:6px;
+        padding:12px 16px; min-width:140px; }}
+.stat .label {{ color:var(--muted); font-size:11px; text-transform:uppercase; }}
+.stat .val   {{ font-size:24px; font-weight:600; margin-top:4px; }}
+details {{ margin-top:16px; }}
+table {{ width:100%; border-collapse:collapse; background:var(--panel);
+         border:1px solid var(--border); border-radius:6px; overflow:hidden; }}
+th, td {{ padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); }}
+th {{ background:#1c2128; color:var(--muted); font-size:12px; }}
+.risk {{ padding:2px 8px; border-radius:4px; font-weight:600; font-size:11px; color:#fff; }}
+.risk.HIGH {{ background:var(--red); }}
+.risk.MED  {{ background:var(--orange); }}
+.risk.LOW  {{ background:var(--green); }}
+</style></head>
+<body>
+<h1>netmon.py — diff report</h1>
+<div class="sub">old: {html_mod.escape(old.get('generated',''))} · new: {html_mod.escape(new.get('generated',''))}</div>
+
+<div class="stats">
+  <div class="stat"><div class="label">New flows</div><div class="val" style="color:var(--red)">{len(result['new_flows'])}</div></div>
+  <div class="stat"><div class="label">Gone flows</div><div class="val" style="color:var(--green)">{len(result['gone_flows'])}</div></div>
+  <div class="stat"><div class="label">Risk transitions</div><div class="val" style="color:var(--orange)">{len(result['risk_transitions'])}</div></div>
+</div>
+
+<details open><summary>New flows ({len(result['new_flows'])})</summary>
+<table><thead><tr><th>Process</th><th>PID</th><th>Local</th><th>Remote</th><th>Risk</th><th>Flags</th></tr></thead>
+<tbody>{new_rows}</tbody></table></details>
+
+<details><summary>Gone flows ({len(result['gone_flows'])})</summary>
+<table><thead><tr><th>Process</th><th>PID</th><th>Local</th><th>Remote</th><th>Risk</th><th>Flags</th></tr></thead>
+<tbody>{gone_rows}</tbody></table></details>
+
+<details open><summary>Risk transitions ({len(result['risk_transitions'])})</summary>
+<table><thead><tr><th>Process</th><th>PID</th><th>Local</th><th>Remote</th><th>Risk</th><th>Flags</th></tr></thead>
+<tbody>{tx_rows}</tbody></table></details>
+
+</body></html>
+"""
+    Path(out_path).write_text(html_out, encoding="utf-8")
 
 
 if __name__ == "__main__":
