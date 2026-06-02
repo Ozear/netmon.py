@@ -4676,12 +4676,22 @@ class SecurityMonitor:
             return None
         # IPv6: [::1]:443  or  ::1:443
         if remote.startswith("["):
-            return remote.split("]")[0][1:]
-        parts = remote.rsplit(":", 1)
-        if len(parts) != 2:
+            ip = remote.split("]")[0][1:]
+        else:
+            parts = remote.rsplit(":", 1)
+            if len(parts) != 2:
+                return None
+            ip = parts[0]
+        if not ip:
             return None
-        ip = parts[0]
-        return ip or None
+        # v1.4: normalize IPv4-mapped IPv6 (::ffff:1.2.3.4) to plain IPv4 so GeoIP,
+        # threat-intel (C2 feed / Tor), local-IP classification, and pcap-flow
+        # correlation all match. Linux dual-stack sockets report inbound IPv4
+        # peers in this form — they previously showed GeoIP "Unknown" and a C2
+        # IP arriving mapped would have bypassed the feed (a real false-negative).
+        if "." in ip and ip.lower().startswith("::ffff:"):
+            return ip.rsplit(":", 1)[-1]
+        return ip
 
     @staticmethod
     def _remote_port(remote):
