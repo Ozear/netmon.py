@@ -32,7 +32,7 @@ import tempfile
 import time
 import urllib.parse
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
@@ -42,6 +42,8 @@ from rich import box
 from rich.console import Console
 from rich.markup import escape as rich_escape
 from rich.table import Table
+from rich.progress import (Progress, SpinnerColumn, BarColumn, TextColumn,
+                           TimeRemainingColumn)
 
 try:
     from ipwhois import IPWhois
@@ -50,7 +52,7 @@ except ImportError:
     HAS_IPWHOIS = False
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0-dev"
 
 log = logging.getLogger("netmon")
 
@@ -98,15 +100,16 @@ SUSPICIOUS_PORTS = {
     4444:  "Metasploit default reverse shell",
     1337:  "Common backdoor / leetspeak",
     31337: "Elite / classic backdoor",
-    3333:  "Common cryptominer pool",
-    5555:  "ADB / Android Debug Bridge",
     6667:  "IRC (legacy C2)",
     6668:  "IRC (legacy C2)",
     9001:  "Tor relay (ORPort)",
     9050:  "Tor SOCKS",
     9999:  "Common reverse-shell port",
-    8333:  "Bitcoin core",
 }
+# NOTE: 3333 (miner pool), 5555 (Android ADB) and 8333 (Bitcoin) were removed in
+# v1.4 — they are legitimate for whole user populations, so as a lone signal they
+# produced more false positives than value. Real miners/backdoors on those ports
+# still surface via other signals (unsigned + outbound + beacon + C2 feed).
 
 # Paths that are inherently suspicious (executables shouldn't normally run from here).
 # NOTE: use regular strings with "\\" — raw strings can't end with a single backslash.
@@ -193,6 +196,18 @@ KNOWN_DNS_RESOLVERS = {"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "1
 # Tor exit-node list (refreshed daily, no auth required)
 TOR_EXIT_LIST_URL = "https://check.torproject.org/torbulkexitlist"
 TOR_CACHE_TTL = 86400  # 24h
+
+# Botnet-C2 IP blocklist — abuse.ch Feodo Tracker. Free, no auth, open data,
+# a single trusted host. Used ONLY by --deep-triage / --threat-intel so QUICK
+# triage stays local-only on a possibly-compromised host. Same hostile-input
+# discipline as the Tor list (cache TTL, size cap, per-line IP validation).
+C2_FEED_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+# Broad historical list (~thousands of IPs) from the SAME host. The curated list
+# above is tiny (it ages IPs out fast — often single digits), so this aggressive
+# list is what gives real coverage. Matches here are HIGH (the IP was C2 but may
+# be stale); a match on the curated list above is CRITICAL.
+C2_FEED_AGGRESSIVE_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist_aggressive.txt"
+C2_FEED_CACHE_TTL = 86400  # 24h
 
 
 # === Pure-python pcap / pcap-ng reader ===
@@ -281,7 +296,11 @@ class PcapReader:
             if len(trailer) < 4:
                 return
             if block_type == self.PCAPNG_SHB:
+                # New section: interface IDs restart at 0 per the pcapng spec, so
+                # reset the map or later sections resolve the wrong link type.
                 # body[0:4] is byte-order magic; we assume little-endian.
+                link_types.clear()
+                interface_count = 0
                 continue
             if block_type == self.PCAPNG_IDB:
                 if len(body) < 2:
@@ -455,14 +474,36 @@ class FlowAnalyzer:
         payload = ip[ihl:]
         self._handle_l4(ts, src_ip, dst_ip, proto, payload)
 
+    IPV6_EXT_HEADERS = frozenset({0, 43, 44, 51, 60})  # HopByHop, Routing, Fragment, AH, DstOpts
+
     def _handle_ipv6(self, ts, ip):
         if len(ip) < 40:
             return
-        proto = ip[6]
+        nh = ip[6]
         src_ip = socket.inet_ntop(socket.AF_INET6, ip[8:24])
         dst_ip = socket.inet_ntop(socket.AF_INET6, ip[24:40])
-        payload = ip[40:]
-        self._handle_l4(ts, src_ip, dst_ip, proto, payload)
+        off = 40
+        # v1.4 (F5): walk the extension-header chain to the real L4 header so
+        # IPv6 TLS/DNS/HTTP — and evasion via a prepended Hop-by-Hop header —
+        # is not dropped before inspection.
+        hops = 0
+        while nh in self.IPV6_EXT_HEADERS and hops < 8:
+            if off + 2 > len(ip):
+                return
+            if nh == 44:  # Fragment: fixed 8 bytes; drop non-first fragments
+                if (((ip[off + 2] << 8) | ip[off + 3]) & 0xFFF8) != 0:
+                    return
+                nxt, adv = ip[off], 8
+            elif nh == 51:  # Authentication Header: (payload_len + 2) * 4 bytes
+                nxt, adv = ip[off], (ip[off + 1] + 2) * 4
+            else:           # HopByHop / Routing / DstOpts: (hdr_ext_len + 1) * 8
+                nxt, adv = ip[off], (ip[off + 1] + 1) * 8
+            off += adv
+            nh = nxt
+            hops += 1
+            if off > len(ip):
+                return
+        self._handle_l4(ts, src_ip, dst_ip, nh, ip[off:])
 
     def _handle_l4(self, ts, src_ip, dst_ip, proto, payload):
         # v1.3 F-1.3: ICMP echo tunnel heuristic. We track per-peer total
@@ -834,6 +875,7 @@ class FlowAnalyzer:
         if depth > MAX_DNS_NAME_DEPTH or idx < 0 or idx >= len(data):
             return None, idx
         labels = []
+        total = 0  # RFC 1035: total decoded name length is bounded to 255 octets
         # When following a pointer, _start_idx is the offset of the pointer
         # itself; any new pointer must point strictly before _start_idx.
         anchor = _start_idx if _start_idx is not None else idx
@@ -859,6 +901,9 @@ class FlowAnalyzer:
                 return None, idx
             idx += 1
             if idx + length > len(data):
+                return None, idx
+            total += length + 1
+            if total > 255:  # bound CPU on hostile compressed-name expansion
                 return None, idx
             labels.append(data[idx:idx + length].decode("ascii", errors="replace"))
             idx += length
@@ -949,14 +994,23 @@ class DNSAnalyzer:
         if label.isdigit():
             return False
         lower = label.lower()
-        # Signal 1: classic high-entropy random-character DGA.
-        if cls._shannon_entropy(lower) >= DNS_DGA_ENTROPY_THRESHOLD:
+        vowels = sum(1 for c in lower if c in "aeiou")
+        vowel_ratio = vowels / len(lower)
+        digits = sum(1 for c in lower if c.isdigit())
+        # v1.4 (F6/R8): dropped the fixed Shannon-entropy gate. It could never
+        # fire for 10-11 char labels (max entropy log2(10)=3.32 < 3.5, missing
+        # the code's own example `mfsj3kr2x9`) yet flagged long distinct-letter
+        # brand SLDs like `stackoverflow` (entropy 3.55). Vowel ratio + digit
+        # density separate real words from DGA far better.
+        #
+        # Signal 1: very few vowels for the length (random / consonant-mash).
+        # Real words and brand SLDs almost always exceed ~18% vowels
+        # (stackoverflow = 0.31, cloudfront = 0.30; mfsj3kr2x9 = 0.0).
+        if vowel_ratio < 0.18:
             return True
-        # Signal 2: long label with very few vowels — typical of keyboard-mash
-        # ("dkjlfhlkdjfghlkdfjh") OR of consonant-DGA families. Real domain
-        # words almost always exceed 15% vowels.
-        vowel_count = sum(1 for c in lower if c in "aeiou")
-        if len(lower) >= 12 and vowel_count / len(lower) < 0.15:
+        # Signal 2: several interspersed digits in an otherwise alphabetic label
+        # (classic alphanumeric DGA). Skips version-like mostly-digit labels.
+        if 3 <= digits < len(lower) and vowel_ratio < 0.30:
             return True
         return False
 
@@ -1205,8 +1259,17 @@ class SignatureChecker:
                 path, status, subject = parts
                 publisher = self._extract_cn_or_o(subject)
                 signed = status == "Valid"
+                # v1.4 (F3): word-boundary prefix match, not substring-anywhere,
+                # so "Discordia Labs" no longer matches "Discord" and an attacker
+                # can't self-authorize with a CN that merely contains a trusted
+                # token. (Bare-token list entries should become full legal names.)
+                pub_l = (publisher or "").strip().lower()
                 trusted = signed and any(
-                    tp.lower() in (publisher or "").lower() for tp in TRUSTED_PUBLISHERS
+                    pub_l == tpl or (
+                        pub_l.startswith(tpl) and len(pub_l) > len(tpl)
+                        and not pub_l[len(tpl)].isalnum()
+                    )
+                    for tpl in (tp.lower() for tp in TRUSTED_PUBLISHERS)
                 )
                 self.cache[path] = {
                     "signed": signed, "publisher": publisher,
@@ -1365,7 +1428,7 @@ class LinuxPackageChecker:
         if tampered:
             return {"signed": True, "publisher": package, "status": "tampered",
                     "trusted": False, "tampered": True}
-        trusted = any(t in package.lower() for t in TRUSTED_LINUX_PACKAGES)
+        trusted = package.lower() in TRUSTED_LINUX_PACKAGES
         return {"signed": True, "publisher": package,
                 "status": f"pkg:{package}", "trusted": trusted, "tampered": False}
 
@@ -1675,7 +1738,8 @@ def classify_direction(local, remote, status):
         return parts[0] if len(parts) == 2 else None
 
     remote_ip = _ip(remote)
-    if remote_ip and (remote_ip.startswith("127.") or remote_ip == "::1"):
+    if remote_ip and (remote_ip.startswith("127.") or remote_ip == "::1"
+                      or remote_ip.startswith("::ffff:127.")):
         return "LOOPBACK"
 
     lport = _port(local)
@@ -1693,12 +1757,11 @@ def classify_direction(local, remote, status):
         return "OUTBOUND"
     if lport < 1024 <= rport:
         return "INBOUND"
-    # Cascade 3: bigger port = more likely client (rough but effective when
-    # both sides are in the 1024-49152 user-port window).
-    if lport > rport:
-        return "OUTBOUND"
-    if rport > lport:
-        return "INBOUND"
+    # v1.4 (F1): removed the port-magnitude tiebreak. It mislabeled outbound-to-
+    # high-port C2 (e.g. :50050) as INBOUND — suppressing UNSIGNED_OUTBOUND_C2 —
+    # and inbound-from-low-ephemeral as OUTBOUND (false C2). When both ports sit
+    # in the same window we genuinely cannot tell from ports alone → AMBIGUOUS
+    # (which still allows the now-weak unsigned-outbound signal to surface it).
     return "AMBIGUOUS"
 
 
@@ -1969,7 +2032,22 @@ def _safe_cache_dir():
     user-specific subdirectory under the tempdir and chmod to 0700 on POSIX.
     """
     base = Path(tempfile.gettempdir()) / f"netmon_cache_{os.getuid() if hasattr(os, 'getuid') else os.getlogin()}"
-    base.mkdir(exist_ok=True)
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+        # Refuse a pre-seeded / symlinked / someone-else's directory — that is
+        # exactly the poisoning this function exists to prevent. Fall back to a
+        # fresh private mkdtemp we created ourselves.
+        st = os.lstat(base)
+        bad = stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISDIR(st.st_mode)
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            bad = True
+        if bad:
+            base = Path(tempfile.mkdtemp(prefix="netmon_cache_"))
+    except OSError:
+        try:
+            base = Path(tempfile.mkdtemp(prefix="netmon_cache_"))
+        except OSError:
+            base = Path(tempfile.gettempdir())
     if hasattr(os, "chmod"):
         try:
             os.chmod(base, 0o700)
@@ -2088,7 +2166,10 @@ SUSPICIOUS_CMDLINE_PATTERNS = [
     # PowerShell encoded / hidden execution. We allow ANY characters between
     # the binary name and the target flag (other flags/values) because real
     # cmdlines look like 'powershell.exe -nop -w hidden -enc AAAA'.
-    (re.compile(r"(?i)\bpowershell(?:\.exe)?\b[^|;]*?\s-e(?:c|nc|ncodedCommand)\b"),
+    # -EncodedCommand accepts ANY unambiguous prefix down to bare -e, so match
+    # -e[a-z]* followed by a long base64 payload (v1.4 F8 — the old regex missed
+    # the ubiquitous `powershell -e <b64>` / `-en` / `-enco` forms).
+    (re.compile(r"(?i)\bpowershell(?:\.exe)?\b[^|;]*?\s-e[a-z]*\b\s+[A-Za-z0-9+/=]{16,}"),
      "PS_ENCODED",     "HIGH"),
     (re.compile(r"(?i)\bpowershell(?:\.exe)?\b[^|;]*?\s-w(?:indowstyle)?\s+hidden\b"),
      "PS_HIDDEN",      "HIGH"),
@@ -2105,8 +2186,11 @@ SUSPICIOUS_CMDLINE_PATTERNS = [
      "BITSADMIN_TRANSFER", "HIGH"),
     (re.compile(r"(?i)\bmshta(?:\.exe)?\s+(?:javascript:|vbscript:|https?://)"),
      "MSHTA_HTTP",     "HIGH"),
-    (re.compile(r"(?i)\brundll32(?:\.exe)?\s+\S+,\s*\S+"),
-     "RUNDLL32_CALL",  "MED"),
+    # Only flag rundll32 when paired with a suspicious indicator (URL / script
+    # scheme / temp path) — the bare `dll,Export` form is normal Windows usage
+    # and flagging it was a constant false positive (v1.4 R5).
+    (re.compile(r"(?i)\brundll32(?:\.exe)?\s+.*(?:javascript:|vbscript:|https?://|\\appdata\\|\\windows\\temp\\|\\users\\public\\|/tmp/)"),
+     "RUNDLL32_SUSPICIOUS", "MED"),
     (re.compile(r"(?i)\bregsvr32(?:\.exe)?\s+(?:/[a-z]+\s+)*/i:https?://"),
      "REGSVR32_HTTP",  "HIGH"),
     # Curl/wget piped into a shell — classic dropper
@@ -2122,7 +2206,11 @@ SUSPICIOUS_CMDLINE_PATTERNS = [
     (re.compile(r"(?i)python[23]?\s+-c\s+[\"'][^\"']*socket\.socket[^\"']*subprocess"),
      "PYTHON_REV_SHELL", "HIGH"),
     # Long base64 blob in cmdline (likely encoded payload)
-    (re.compile(r"[A-Za-z0-9+/]{200,}={0,2}"),
+    # Raised 200 -> 300 (v1.4 R5): Chrome/Electron --field-trial-handle and
+    # similar handles are ~100-250 chars and were matching. Genuine encoded
+    # payloads are typically longer; with the v1.4 corroboration rule a lone
+    # LONG_BASE64 no longer reaches HIGH anyway.
+    (re.compile(r"[A-Za-z0-9+/]{300,}={0,2}"),
      "LONG_BASE64",    "MED"),
     # WMI lateral movement
     (re.compile(r"(?i)\bwmic\s+.*\bprocess\s+call\s+create\b"),
@@ -2441,14 +2529,53 @@ class PersistenceScanner:
                     self._add("cron", name, path, command=cmd, mtime=st.st_mtime)
             except OSError:
                 continue
-        # 3. rc-local / init.d / profile.d (legacy persistence)
-        for path in ("/etc/rc.local", "/etc/profile"):
+        # 3. rc-local / profile / shell-rc (legacy persistence)
+        for path in ("/etc/rc.local", "/etc/profile", "/etc/bash.bashrc",
+                     "/etc/zsh/zshrc"):
             if os.path.isfile(path):
                 try:
-                    mtime = os.path.getmtime(path)
-                    self._add("rc", os.path.basename(path), path, mtime=mtime)
+                    self._add("rc", os.path.basename(path), path,
+                              mtime=os.path.getmtime(path))
                 except OSError:
                     pass
+        # v1.4: LD_PRELOAD global preload file — a classic Linux rootkit /
+        # persistence channel (every dynamically-linked binary loads it).
+        if os.path.isfile("/etc/ld.so.preload"):
+            try:
+                with open("/etc/ld.so.preload", errors="ignore") as f:
+                    cmd = f.read(400).strip()
+                self._add("ld_preload", "ld.so.preload", "/etc/ld.so.preload",
+                          command=cmd, mtime=os.path.getmtime("/etc/ld.so.preload"))
+            except OSError:
+                pass
+        # v1.4: drop-in dirs that auto-run on shell login / boot.
+        for ddir, kind in (("/etc/profile.d", "profile.d"), ("/etc/init.d", "initd")):
+            if not os.path.isdir(ddir):
+                continue
+            try:
+                for name in sorted(os.listdir(ddir)):
+                    p = os.path.join(ddir, name)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    if stat_mod.S_ISREG(st.st_mode):
+                        self._add(kind, name, p, mtime=st.st_mtime)
+            except OSError:
+                pass
+        # v1.4: systemd timers (scheduled persistence distinct from units).
+        if shutil.which("systemctl"):
+            try:
+                r = subprocess.run(
+                    ["systemctl", "list-timers", "--all", "--no-pager", "--no-legend"],
+                    capture_output=True, text=True, timeout=10, check=False)
+                for line in (r.stdout or "").splitlines():
+                    for tok in line.split():
+                        if tok.endswith(".timer"):
+                            self._add("systemd_timer", tok, "")
+                            break
+            except (OSError, subprocess.SubprocessError):
+                pass
 
     def _systemd_unit_path(self, unit):
         """Resolve a unit name to its file path via `systemctl show -p FragmentPath`."""
@@ -2708,6 +2835,15 @@ class PersistenceScanner:
                     # for a flag.
                     if (w.startswith("-") or w.startswith("/")) and len(w) < 40:
                         break
+                    # v1.4 (F13): stop as soon as the accumulated candidate is a
+                    # real file — handles executables whose extension is outside
+                    # _BIN_EXTENSIONS (.scr/.pif/.cpl/.msc/.wsf …) so we don't glue
+                    # argument tokens onto the path and then fail to hash it.
+                    try:
+                        if os.path.isfile(cand):
+                            break
+                    except OSError:
+                        pass
                     cand = cand + " " + w
                     if cand.lower().endswith(PersistenceScanner._BIN_EXTENSIONS):
                         break
@@ -2766,7 +2902,11 @@ class LogReader:
     SCRUB_PATTERNS = [
         re.compile(r"password=[^&\s]+",                    re.IGNORECASE),
         re.compile(r"passwd=[^&\s]+",                      re.IGNORECASE),
-        re.compile(r"token=[A-Za-z0-9._\-]{12,}",          re.IGNORECASE),
+        # v1.4 S4: token value can contain +/= (base64) — [^\s&]+ stops leaking
+        # the tail; added Authorization Basic/Bearer + api-key/secret/aws keys.
+        re.compile(r"token=[^\s&]+",                       re.IGNORECASE),
+        re.compile(r"\bauthorization:\s*(?:basic|bearer|negotiate)\s+\S+", re.IGNORECASE),
+        re.compile(r"\b(?:api[_-]?key|secret|client_secret|aws_[a-z_]*key)\b\s*[=:]\s*\S+", re.IGNORECASE),
         re.compile(r"-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----"),
         re.compile(r"\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),  # emails
         re.compile(r"\bey[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\b"),  # JWT
@@ -2912,9 +3052,11 @@ class LogReader:
                     sev = "MED"
                     ev = "HTTP_POST_SCRIPT"
                 if any(s in path for s in ("../", "%2e%2e", "etc/passwd", "/proc/")):
-                    sev = "HIGH"; ev = "PATH_TRAVERSAL_ATTEMPT"
+                    sev = "HIGH"
+                    ev = "PATH_TRAVERSAL_ATTEMPT"
                 if any(s in path.lower() for s in ("union+select", "union%20select", "' or '1'='1")):
-                    sev = "HIGH"; ev = "SQLI_ATTEMPT"
+                    sev = "HIGH"
+                    ev = "SQLI_ATTEMPT"
                 msg = f"{method} {path} → {status}"
                 self._add(source, ts_unix, sev, ev, "", ip, msg)
                 return
@@ -2958,14 +3100,20 @@ class LogReader:
             self._add(source, ts_unix, "LOW", prog or "msg", "", "", message)
 
     def _parse_syslog_ts(self, ts):
-        # Try RFC5424 first
+        # Try RFC5424 first — KEEP the timezone (v1.4 F9). The old code stripped
+        # the offset and read the result as host-local, shifting every event on a
+        # non-UTC host and silently dropping genuinely-recent ones.
         try:
             if "T" in ts:
-                # 2025-12-31T14:23:45+00:00
-                clean = ts.split("+")[0].split("Z")[0]
-                if "." in clean:
-                    clean = clean.split(".")[0]
-                return datetime.fromisoformat(clean).timestamp()
+                iso = ts.strip().replace("Z", "+00:00")
+                # Truncate over-long fractional seconds (syslog can emit ns).
+                m = re.match(r"(.*T\d{2}:\d{2}:\d{2})(\.\d+)?(.*)$", iso)
+                if m:
+                    iso = m.group(1) + (m.group(2) or "")[:7] + (m.group(3) or "")
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
         except (ValueError, TypeError):
             pass
         # BSD syslog: "Sep 12 14:23:45" — no year. Assume current year.
@@ -2980,11 +3128,15 @@ class LogReader:
             return None
 
     def _parse_apache_ts(self, ts):
-        # 01/Jan/2025:12:34:56 +0000
+        # 01/Jan/2025:12:34:56 +0000 — keep the offset (v1.4 F9).
         try:
-            return datetime.strptime(ts.split(" ")[0], "%d/%b/%Y:%H:%M:%S").timestamp()
+            return datetime.strptime(ts.strip(), "%d/%b/%Y:%H:%M:%S %z").timestamp()
         except (ValueError, TypeError):
-            return None
+            try:
+                dt = datetime.strptime(ts.split(" ")[0], "%d/%b/%Y:%H:%M:%S")
+                return dt.replace(tzinfo=timezone.utc).timestamp()
+            except (ValueError, TypeError):
+                return None
 
     # --- Windows ---
 
@@ -3393,8 +3545,19 @@ class LogReader:
                 if not m:
                     continue
                 try:
-                    ts_clean = m.group(1).split(".")[0]
-                    ts_unix = datetime.strptime(ts_clean, "%Y-%m-%d %H:%M:%S").timestamp()
+                    # v1.4 (F9): keep the timezone. macOS `log show` emits e.g.
+                    # "2025-12-31 14:23:45.123456-0800"; the old split(".")[0]
+                    # dropped both fraction AND offset -> naive local time.
+                    raw = m.group(1).strip()
+                    mt = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)?\s*([+-]\d{4})?", raw)
+                    if not mt:
+                        continue
+                    if mt.group(2):
+                        ts_unix = datetime.strptime(mt.group(1) + mt.group(2),
+                                                    "%Y-%m-%d %H:%M:%S%z").timestamp()
+                    else:
+                        ts_unix = datetime.strptime(mt.group(1), "%Y-%m-%d %H:%M:%S") \
+                            .replace(tzinfo=timezone.utc).timestamp()
                 except (ValueError, TypeError):
                     continue
                 prog = m.group(2)
@@ -3559,8 +3722,9 @@ def looks_like_doh(remote_ip, remote_port, hostname):
     """Return True if a connection looks like DNS-over-HTTPS."""
     if remote_port != 443:
         return False
-    if remote_ip in DOH_HOSTS:
-        return True
+    # v1.4 (R6): require a DoH *hostname* signal (SNI / resolved name), not a bare
+    # IP match — many resolver IPs (1.1.1.1, 8.8.8.8) serve ordinary HTTPS too, so
+    # IP-only matching flagged benign `curl https://1.1.1.1` / health checks.
     if hostname:
         host_lower = hostname.lower()
         if any(host_lower == h or host_lower.endswith("." + h) for h in DOH_HOSTS):
@@ -3646,6 +3810,8 @@ def compute_ja3(client_hello_body):
             etype = struct.unpack(">H", buf[idx:idx+2])[0]
             elen = struct.unpack(">H", buf[idx+2:idx+4])[0]
             idx += 4
+            if idx + elen > ext_end:   # extension body overruns the block — stop
+                break
             ebody = buf[idx:idx+elen]
             idx += elen
             if etype in GREASE:
@@ -3693,14 +3859,20 @@ def compute_diff(old, new):
     """Compute the diff between two run dicts. Returns a dict with keys:
        new_flows / gone_flows / risk_transitions, each a list."""
     def _key(r):
-        return (r.get("app"), r.get("pid"), r.get("local"), r.get("remote"))
+        # v1.4 (B3): key on stable flow identity. pid and the ephemeral local
+        # port change every run, so keying on them reported nearly every
+        # persistent flow as both "gone" and "new" and missed real risk changes.
+        rip = SecurityMonitor._remote_ip(r.get("remote") or "")
+        rport = SecurityMonitor._remote_port(r.get("remote") or "")
+        return (r.get("app"), rip, rport, r.get("status"))
     old_by_key = {_key(r): r for r in old.get("connections", [])}
     new_by_key = {_key(r): r for r in new.get("connections", [])}
     new_flows = [new_by_key[k] for k in new_by_key.keys() - old_by_key.keys()]
     gone_flows = [old_by_key[k] for k in old_by_key.keys() - new_by_key.keys()]
     transitions = []
     for k in new_by_key.keys() & old_by_key.keys():
-        old_r = old_by_key[k]; new_r = new_by_key[k]
+        old_r = old_by_key[k]
+        new_r = new_by_key[k]
         if old_r.get("risk") != new_r.get("risk"):
             transitions.append({"key": list(k),
                                 "from": old_r.get("risk"),
@@ -3815,18 +3987,26 @@ def classify_local_ip(ip):
 
 
 class ThreatIntel:
-    def __init__(self, offline=False, scan_tor=False, console=None):
+    def __init__(self, offline=False, scan_tor=False, threat_intel=False, console=None):
         self.offline = offline
         self.scan_tor = scan_tor
+        self.threat_intel = threat_intel
         self.console = console
         self.tor_exits = set()
+        self.c2_ips = set()         # curated, high-confidence -> CRITICAL
+        self.c2_ips_broad = set()   # broad history -> HIGH
         self._whois_cache = {}
         self._cache_dir = _safe_cache_dir()
-        # Tor exit-list fetch is now OPT-IN (--scan-tor). v1.1 made it default-on
-        # and many networks SNI-filter torproject.org, producing a noisy warning
-        # on every run. Users who want Tor-exit detection can pass --scan-tor.
+        # Tor exit-list fetch is OPT-IN (--scan-tor / --deep-triage). v1.1 made
+        # it default-on and many networks SNI-filter torproject.org, producing a
+        # noisy warning on every run — and on a possibly-compromised host you do
+        # NOT want the triage tool itself reaching out to torproject.org.
         if not offline and scan_tor:
             self._load_tor_exits()
+        # Botnet-C2 IP feed (abuse.ch Feodo). Opt-in (--threat-intel /
+        # --deep-triage) so QUICK triage makes no external intel calls.
+        if not offline and threat_intel:
+            self._load_c2_feed()
 
     def _load_tor_exits(self):
         cache_file = self._cache_dir / "tor_exits.txt"
@@ -3884,6 +4064,68 @@ class ThreatIntel:
 
     def is_tor_exit(self, ip):
         return ip in self.tor_exits
+
+    def _fetch_ip_set(self, url, cache_name):
+        """Fetch a newline-delimited IP blocklist with 24h cache, 8 MB cap and
+        per-line inet validation. Returns a set of IPv4 strings (never raises) —
+        a poisoned upstream can neither DoS nor inject."""
+        cache_file = self._cache_dir / cache_name
+        try:
+            if cache_file.exists():
+                age = time.time() - cache_file.stat().st_mtime
+                if age < C2_FEED_CACHE_TTL and cache_file.stat().st_size <= MAX_TOR_LIST_BYTES:
+                    return {ln for ln in cache_file.read_text().splitlines() if _is_valid_ip(ln)}
+        except OSError as e:
+            log.debug("c2 cache read failed (%s): %s", cache_name, e)
+        ips = set()
+        try:
+            with requests.get(url, timeout=TOR_FETCH_TIMEOUT, stream=True) as r:
+                if r.status_code != 200:
+                    log.warning("c2 feed HTTP %d (%s)", r.status_code, url)
+                    return ips
+                buf = bytearray()
+                for chunk in r.iter_content(chunk_size=65536):
+                    buf.extend(chunk)
+                    if len(buf) > MAX_TOR_LIST_BYTES:
+                        log.warning("c2 feed exceeded %d bytes; aborting", MAX_TOR_LIST_BYTES)
+                        return ips
+                for raw_line in buf.decode("ascii", errors="replace").splitlines():
+                    line = raw_line.strip()
+                    if line and not line.startswith("#") and _is_valid_ip(line):
+                        ips.add(line)
+            try:
+                cache_file.write_text("\n".join(sorted(ips)))
+            except OSError as e:
+                log.debug("c2 cache write failed (%s): %s", cache_name, e)
+        except requests.RequestException as e:
+            log.warning("c2 feed fetch failed (%s): %s", url, e)
+        return ips
+
+    def _load_c2_feed(self):
+        """Load the abuse.ch Feodo Tracker C2 IP blocklists (free, no auth, open
+        data, single trusted host) in two confidence tiers:
+          - ipblocklist.txt             currently-active, high-confidence -> CRITICAL
+          - ipblocklist_aggressive.txt  broad history (thousands)         -> HIGH
+        The curated list is often tiny (single digits); the aggressive list is
+        what gives real coverage."""
+        self.c2_ips = self._fetch_ip_set(C2_FEED_URL, "c2_feed.txt")
+        self.c2_ips_broad = self._fetch_ip_set(C2_FEED_AGGRESSIVE_URL, "c2_feed_aggressive.txt")
+        if self.console:
+            self.console.print(
+                f"[dim]Threat-intel: {len(self.c2_ips)} high-confidence + "
+                f"{len(self.c2_ips_broad)} historical C2 IPs (abuse.ch Feodo Tracker).[/dim]")
+
+    def is_known_c2(self, ip):
+        return ip in self.c2_ips or ip in self.c2_ips_broad
+
+    def c2_confidence(self, ip):
+        """'high' = curated / currently-active (CRITICAL); 'broad' = historical
+        (HIGH); None = not listed."""
+        if ip in self.c2_ips:
+            return "high"
+        if ip in self.c2_ips_broad:
+            return "broad"
+        return None
 
     def whois(self, ip):
         if not HAS_IPWHOIS or self.offline or not ip:
@@ -3957,7 +4199,9 @@ class VirusTotalClient:
                 log.debug("virustotal: HTTP %d for hash lookup", r.status_code)
         except (requests.RequestException, ValueError) as e:
             log.debug("virustotal lookup failed: %s", e)
-        self.cache[sha256] = None
+        # v1.4 (F7): do NOT cache transient failures (429 / auth / network) — a
+        # routine free-tier rate-limit would otherwise become a permanent
+        # per-hash blind spot for the rest of the run. Only 200/404 are cached.
         return None
 
 
@@ -3975,6 +4219,11 @@ class SecurityMonitor:
         self.session_start = {}
         self.ip_cache = {}
         self.file_hash_cache = {}
+        # Per-process metadata cache keyed by pid -> (create_time, meta). The
+        # monitor polls every second; without this cache each pass re-ran ~6
+        # psutil calls + a SHA-256 for every connection. create_time validation
+        # also defeats PID reuse (a recycled PID forces a fresh resolve).
+        self._proc_meta_cache = {}
         self.headers = {"User-Agent": f"netmon.py/{VERSION}"}
         # Code-signing/trust checker. On Windows: Authenticode. On Linux:
         # owning-package via dpkg/rpm/pacman/apk. On macOS: codesign.
@@ -3990,6 +4239,7 @@ class SecurityMonitor:
         self.threat = ThreatIntel(
             offline=args.offline,
             scan_tor=getattr(args, "scan_tor", False),
+            threat_intel=getattr(args, "threat_intel", False),
             console=console,
         )
         self.vt = VirusTotalClient(args.vt_api_key, console=console) if args.vt_api_key else None
@@ -4160,6 +4410,10 @@ class SecurityMonitor:
     def analyze_risk(self, conn):
         score = 0
         flags = []
+        # v1.4 (Stage 2): confirmed-bad evidence → CRITICAL regardless of score.
+        # Heuristic signals only sum toward HIGH; this separates "confirmed" from
+        # "suspicious" so a wall of unsigned dev tools never outranks real malware.
+        confirmed = False
         path_lower = (conn["path"] or "").lower().replace("/", "\\")
         app_lower = (conn["app"] or "").lower()
 
@@ -4168,12 +4422,17 @@ class SecurityMonitor:
             score += 3
             flags.append("HIGH_RISK_PATH")
 
-        # 2. System binary in wrong location (e.g. svchost.exe outside System32)
+        # 2. System binary in wrong location (e.g. svchost.exe outside System32).
+        # v1.4 (F2): anchor the expected directory to the START of the path (after
+        # the drive letter) instead of substring-anywhere, so an attacker folder
+        # like C:\Users\Public\Windows\System32\svchost.exe no longer passes.
         expected = SYSTEM_BINARY_LOCATIONS.get(app_lower)
-        if expected and path_lower and path_lower not in ("n/a", "access denied") \
-                and not any(loc in path_lower for loc in expected):
-            score += 5  # always HIGH — impostors are critical
-            flags.append("IMPOSTOR_SYSTEM_BIN")
+        if expected and path_lower and path_lower not in ("n/a", "access denied"):
+            anchored = path_lower[2:] if (len(path_lower) > 2 and path_lower[1] == ":") else path_lower
+            if not any(anchored.startswith(loc) for loc in expected):
+                score += 5
+                confirmed = True  # masquerading as a system binary is confirmed-bad
+                flags.append("IMPOSTOR_SYSTEM_BIN")
 
         # 3. Suspicious port
         port = self._remote_port(conn["remote"])
@@ -4186,6 +4445,20 @@ class SecurityMonitor:
         if ip and self.threat.is_tor_exit(ip):
             score += 3
             flags.append("TOR_EXIT")
+
+        # 4a. Known botnet-C2 IP (abuse.ch Feodo feed; armed by --threat-intel /
+        # --deep-triage). A confirmed-bad destination is HIGH on its own.
+        # v1.4: abuse.ch Feodo C2 feed, tiered by confidence. The curated
+        # high-confidence list (currently-active C2) is CONFIRMED -> CRITICAL;
+        # the broad historical list is HIGH (the IP was C2 but may be stale).
+        c2_conf = self.threat.c2_confidence(ip) if ip else None
+        if c2_conf == "high":
+            score += 5
+            confirmed = True
+            flags.append("C2_FEED_MATCH")
+        elif c2_conf == "broad":
+            score += 5
+            flags.append("C2_FEED_HISTORICAL")
 
         # 4b. CrowdSec verdict on the remote IP (T2-1)
         cs_verdict = conn.get("crowdsec")
@@ -4207,6 +4480,7 @@ class SecurityMonitor:
         # so this is HIGH-risk on its own.
         if is_tampered:
             score += 5
+            confirmed = True  # a modified packaged binary is confirmed-bad
             flags.append("PACKAGE_TAMPERED")
 
         soft_path_hit = any(frag in path_lower for frag in (s.lower() for s in SOFT_SUSPICIOUS_PATH_FRAGMENTS))
@@ -4241,9 +4515,14 @@ class SecurityMonitor:
             and not is_tampered
         )
 
+        # v1.4 (R1): unsigned alone is WEAK. On Linux every locally-built / pip /
+        # npm / cargo binary is "unsigned"; on Windows so is every portable / venv
+        # / dev tool. So unsigned (+1) and unsigned-outbound (+1) sum only to MED,
+        # and HIGH now REQUIRES a corroborating signal (bad path/port, Tor, C2
+        # feed, CrowdSec, beacon, JA3, VT, cmdline) rather than unsigned alone.
         if (conn["path"] and conn["path"] not in ("N/A", "Access Denied")
                 and ip and not is_signed and not suppress_unsigned):
-            score += 2
+            score += 1
             flags.append("UNSIGNED_BINARY")
 
         # 6b. UNSIGNED_OUTBOUND_C2: fires for OUTBOUND or AMBIGUOUS direction.
@@ -4257,7 +4536,7 @@ class SecurityMonitor:
                 and classify_local_ip(ip) is None
                 and direction in ("OUTBOUND", "AMBIGUOUS")
                 and not suppress_unsigned):
-            score += 3
+            score += 1
             flags.append("UNSIGNED_OUTBOUND_C2")
 
         # 6c. INBOUND_SESSION informational flag (no risk bump). Surfaces the
@@ -4275,10 +4554,14 @@ class SecurityMonitor:
         # daemons accept inbound, they don't dial out — this is the textbook
         # reverse-shell fingerprint regardless of whether the binary is
         # signed / packaged.
+        # v1.4 (R2): require a NON-web destination port. Legit web servers dial
+        # out on 80/443 constantly (proxy_pass upstreams, ACME/OCSP, webhooks); a
+        # server daemon connecting OUT to an odd port is the real signal.
         if (is_server_binary(conn.get("app"))
                 and direction == "OUTBOUND"
                 and status == "ESTABLISHED"
-                and ip and classify_local_ip(ip) is None):
+                and ip and classify_local_ip(ip) is None
+                and port not in (80, 443, 8080, 8443)):
             score += 5
             flags.append("REVERSE_SHELL_LIKELY")
 
@@ -4304,6 +4587,10 @@ class SecurityMonitor:
                     score += 5
                 elif sev == "MED":
                     score += 2
+                # v1.4: an actual reverse-shell / dropper one-liner is confirmed-bad.
+                if any(k in cf for cf in cmd_flags
+                       for k in ("REV_SHELL", "DOWNLOAD_PIPE_SHELL", "BASH_C_CURL")):
+                    confirmed = True
 
         # F-2.1: Web-shell spawn — web-server process has a blocklisted child.
         # Implemented as: this row IS the blocklisted child AND its parent is
@@ -4311,6 +4598,7 @@ class SecurityMonitor:
         if (is_blocklisted_child(conn.get("app"))
                 and is_web_server_process(conn.get("parent_app"))):
             score += 5
+            confirmed = True  # web server spawning a shell is confirmed-bad
             flags.append("WEB_SHELL_SPAWN")
 
         # F-2.5: Web-runtime user making outbound to public — extremely
@@ -4347,6 +4635,7 @@ class SecurityMonitor:
         ja3 = conn.get("ja3")
         if ja3 and ja3 in KNOWN_BAD_JA3:
             score += 5
+            confirmed = True  # known-C2 TLS fingerprint is confirmed-bad
             flags.append(f"JA3_C2_{KNOWN_BAD_JA3[ja3][:24].replace(' ', '_')}")
 
         # F-1.3: ICMP-tunnel — peer flagged by FlowAnalyzer's per-peer
@@ -4361,6 +4650,7 @@ class SecurityMonitor:
             mal = vt.get("malicious", 0)
             if mal >= 5:
                 score += 5
+                confirmed = True  # multi-vendor VT malicious is confirmed-bad
                 flags.append(f"VT_MALICIOUS_{mal}")
             elif mal >= 1:
                 score += 2
@@ -4371,6 +4661,9 @@ class SecurityMonitor:
 
         # 8. Beaconing (filled in later, after history accumulated)
 
+        # v1.4 tiers: CONFIRMED-bad → CRITICAL; otherwise additive heuristic score.
+        if confirmed:
+            return "CRITICAL", flags
         if score >= 5:
             return "HIGH", flags
         if score >= 2:
@@ -4460,6 +4753,85 @@ class SecurityMonitor:
             pass
         return pids
 
+    def _resolve_proc_meta(self, pid, default_app):
+        """Resolve per-process metadata (name/exe/user/hash/cmdline/ppid/parent),
+        cached by (pid, create_time) so the per-second monitor loop doesn't
+        re-run ~6 psutil calls + a SHA-256 for every connection on every pass.
+        create_time validation also defeats PID reuse."""
+        meta_default = {
+            "app": default_app, "path": "N/A", "user": "N/A", "hash": "N/A",
+            "cmdline": "", "ppid": None, "parent_app": "",
+        }
+        if not pid:
+            return meta_default
+        proc = None
+        ctime = None
+        try:
+            proc = psutil.Process(pid)
+            ctime = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+        if ctime is not None:
+            cached = self._proc_meta_cache.get(pid)
+            if cached is not None and cached[0] == ctime:
+                return cached[1]
+        meta = dict(meta_default)
+        try:
+            if proc is None:
+                proc = psutil.Process(pid)
+            meta["app"] = proc.name()
+            meta["path"] = proc.exe()
+            meta["user"] = proc.username()
+            meta["hash"] = self.get_file_hash(meta["path"])
+            try:
+                meta["cmdline"] = " ".join(proc.cmdline())[:4096]
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                meta["cmdline"] = ""
+            try:
+                ppid = proc.ppid()
+                meta["ppid"] = ppid
+                if ppid:
+                    meta["parent_app"] = psutil.Process(ppid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                meta["ppid"] = None
+                meta["parent_app"] = ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            meta["app"] = "System/Protected"
+            meta["path"] = "Access Denied"
+        if ctime is not None:
+            if len(self._proc_meta_cache) > 200_000:
+                self._proc_meta_cache.clear()
+            self._proc_meta_cache[pid] = (ctime, meta)
+        return meta
+
+    def _prewarm_hashes(self):
+        """Hash the executables of processes that currently hold sockets, in
+        parallel, so the per-second monitor loop never blocks on a cold SHA-256.
+        Only the connected pids are hashed (the same set the loop needs).
+        Best-effort — any failure falls back to the inline get_file_hash path."""
+        try:
+            pids = {c.pid for c in psutil.net_connections(kind="inet") if c.pid}
+        except (psutil.Error, OSError):
+            return
+        paths = set()
+        for pid in pids:
+            try:
+                exe = psutil.Process(pid).exe()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+            if exe and exe not in self.file_hash_cache:
+                paths.add(exe)
+        if not paths:
+            return
+        self.console.print(f"[dim]Pre-hashing {len(paths)} binaries...[/dim]")
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            workers = min(8, (os.cpu_count() or 2) * 2)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(self.get_file_hash, paths))
+        except (OSError, RuntimeError) as e:
+            log.debug("hash prewarm failed: %s", e)
+
     def get_connections(self):
         connections = []
         self_pids = self._netmon_self_pids()
@@ -4480,33 +4852,16 @@ class SecurityMonitor:
                     default_app = "(closed/pid-0)"
                 else:
                     default_app = "Unknown"
-                app_name, exe_path, username, file_hash = default_app, "N/A", "N/A", "N/A"
-                cmdline = ""
-                ppid = None
-                parent_app = ""
-                if pid:
-                    try:
-                        proc = psutil.Process(pid)
-                        app_name = proc.name()
-                        exe_path = proc.exe()
-                        username = proc.username()
-                        file_hash = self.get_file_hash(exe_path)
-                        # v1.3 F-5.1 / F-6.2: cmdline + parent PID lineage
-                        try:
-                            cmdline_list = proc.cmdline()
-                            cmdline = " ".join(cmdline_list)[:4096]
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                            cmdline = ""
-                        try:
-                            ppid = proc.ppid()
-                            if ppid:
-                                parent_app = psutil.Process(ppid).name()
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                            ppid = None
-                            parent_app = ""
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        app_name = "System/Protected"
-                        exe_path = "Access Denied"
+                # Cached by (pid, create_time) — see _resolve_proc_meta. Avoids
+                # re-running ~6 psutil calls + a SHA-256 per connection every pass.
+                meta = self._resolve_proc_meta(pid, default_app)
+                app_name = meta["app"]
+                exe_path = meta["path"]
+                username = meta["user"]
+                file_hash = meta["hash"]
+                cmdline = meta["cmdline"]
+                ppid = meta["ppid"]
+                parent_app = meta["parent_app"]
 
                 ip = self._remote_ip(remote_addr)
                 ip_info = self.get_ip_details(ip) if ip else {
@@ -4590,7 +4945,9 @@ class SecurityMonitor:
     def _make_alt_row(self, sock, transport):
         pid = sock.get("pid")
         app_name, exe_path, username = "Unknown", "N/A", "N/A"
-        cmdline = ""; ppid = None; parent_app = ""
+        cmdline = ""
+        ppid = None
+        parent_app = ""
         if pid:
             try:
                 proc = psutil.Process(pid)
@@ -4608,7 +4965,8 @@ class SecurityMonitor:
                 except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                     pass
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                app_name = "System/Protected"; exe_path = "Access Denied"
+                app_name = "System/Protected"
+                exe_path = "Access Denied"
         # For SCTP the remote field is populated for assocs; UDS has none.
         remote = sock.get("remote") or ""
         local = sock.get("local") or ""
@@ -4650,24 +5008,60 @@ class SecurityMonitor:
                 self.console.print("[yellow]Capture failed to start (need elevation?). Continuing without capture.[/yellow]")
                 self.capture = None
 
+        # Warm the file-hash cache in parallel so the per-second loop never
+        # blocks on a cold SHA-256 (keeps the live monitor responsive).
+        self._prewarm_hashes()
+
         try:
-            while (datetime.now() - start).total_seconds() < self.args.time:
-                now = time.time()
-                for conn in self.get_connections():
-                    # Bound per-run state to prevent unbounded growth on long runs
-                    # or noisy hosts. New entries past the cap are silently dropped.
-                    if len(self.conn_history) >= MAX_CONN_HISTORY:
-                        log.warning("conn_history cap reached (%d); dropping new entries",
-                                    MAX_CONN_HISTORY)
-                        break
-                    key = (conn["pid"], conn["remote"]) if conn["remote"] else (conn["pid"], conn["local"], "L")
-                    self.conn_history[key] = conn
-                    if len(self.first_seen) < MAX_FIRST_SEEN:
-                        fs_key = (conn["pid"], conn["local"], conn["remote"])
-                        self.first_seen.setdefault(fs_key, now)
-                        # Track session-start wall time for the session-age column
-                        self.session_start.setdefault(fs_key, now)
-                time.sleep(1)
+            # Interactive live monitor — progress bar + live socket activity so
+            # the operator stays oriented during the (deliberately longer) triage
+            # window. Auto-disabled on non-TTY (piped / CI) runs; the loop and all
+            # bookkeeping are identical either way.
+            total_s = max(1, int(self.args.time))
+            last_seen = "-"
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold cyan]Live monitor[/bold cyan]"),
+                BarColumn(),
+                TextColumn("[dim]{task.fields[status]}[/dim]"),
+                TimeRemainingColumn(),
+                console=self.console,
+                transient=False,
+                disable=not self.console.is_terminal,
+            ) as progress:
+                task = progress.add_task("monitor", total=total_s, status="starting...")
+                while (datetime.now() - start).total_seconds() < self.args.time:
+                    now = time.time()
+                    for conn in self.get_connections():
+                        # v1.4 (B1): key on (pid, transport, local, remote) so UDP
+                        # / multi-transport / multiple sockets to the same peer no
+                        # longer collapse (last-writer-wins) and vanish from the
+                        # report. Matches the alt-transport key format below.
+                        key = (conn["pid"], conn.get("transport"), conn["local"], conn["remote"])
+                        # v1.4 (B2): once full, skip only NEW keys; keep refreshing
+                        # existing rows instead of going blind mid-snapshot.
+                        if key not in self.conn_history and len(self.conn_history) >= MAX_CONN_HISTORY:
+                            log.warning("conn_history cap reached (%d); dropping new entries",
+                                        MAX_CONN_HISTORY)
+                            continue
+                        # Live activity line: surface the newest outbound socket.
+                        if key not in self.conn_history and conn.get("remote"):
+                            _ip = self._remote_ip(conn["remote"])
+                            if _ip:
+                                last_seen = f"{(conn.get('app') or '?')[:18]} -> {_ip}"
+                        self.conn_history[key] = conn
+                        if len(self.first_seen) < MAX_FIRST_SEEN:
+                            fs_key = (conn["pid"], conn["local"], conn["remote"])
+                            self.first_seen.setdefault(fs_key, now)
+                            # Track session-start wall time for the session-age column
+                            self.session_start.setdefault(fs_key, now)
+                    progress.update(
+                        task,
+                        completed=min((datetime.now() - start).total_seconds(), total_s),
+                        status=f"{len(self.conn_history)} sockets - last: {last_seen}",
+                    )
+                    time.sleep(1)
+                progress.update(task, completed=total_s, status="done")
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Monitoring interrupted by user.[/yellow]")
             raise
@@ -4768,12 +5162,14 @@ class SecurityMonitor:
         # Firewall per-port verdict (T2-3)
         if self.firewall and self.firewall.backend:
             for conn in self.conn_history.values():
-                # For listeners, the local port is what's exposed; for active
-                # connections we still annotate the local port (the listener's
-                # accept side) so a daemon row carries its allow/deny verdict.
-                lport = self._local_port(conn["local"])
-                if lport is not None:
-                    conn["firewall"] = self.firewall.verdict_for_port(lport)
+                # v1.4 (R7): only a local *listen* port has a meaningful firewall
+                # verdict. For OUTBOUND rows the local port is ephemeral, so the
+                # old code annotated a misleading "blocked"/"allowed" for a random
+                # port. Annotate listeners / inbound only.
+                if conn.get("direction") in ("LISTEN", "INBOUND"):
+                    lport = self._local_port(conn["local"])
+                    if lport is not None:
+                        conn["firewall"] = self.firewall.verdict_for_port(lport)
 
         # Session age (T3-1): wall-clock seconds since the (pid, local, remote)
         # tuple was first observed in this run. Best-effort — for ESTABLISHED
@@ -4867,14 +5263,17 @@ class SecurityMonitor:
 
         # Beacon detection (raises risk one level if periodic)
         beacons = self.detect_beacons()
-        for key, info in beacons.items():
-            if key in self.conn_history:
-                conn = self.conn_history[key]
-                conn["flags"].append(f"BEACON_{info['mean_interval_s']}s")
-                if conn["risk"] == "LOW":
-                    conn["risk"] = "MED"
-                elif conn["risk"] == "MED":
-                    conn["risk"] = "HIGH"
+        # v1.4 (B1): conn_history is now keyed by the 4-tuple, but beacons are
+        # keyed (pid, remote). Match every history row with that pid+remote so the
+        # BEACON flag + risk bump land on all of the peer's sockets.
+        for (b_pid, b_remote), info in beacons.items():
+            for conn in self.conn_history.values():
+                if conn.get("pid") == b_pid and conn.get("remote") == b_remote:
+                    conn["flags"].append(f"BEACON_{info['mean_interval_s']}s")
+                    if conn["risk"] == "LOW":
+                        conn["risk"] = "MED"
+                    elif conn["risk"] == "MED":
+                        conn["risk"] = "HIGH"
 
         # Promote risk for connections that DNS heuristics already flagged.
         for conn in self.conn_history.values():
@@ -4943,7 +5342,7 @@ def export_text(conn_history, path, console, args=None, flow=None,
     if not conn_history:
         return
 
-    risk_order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MED": 2, "LOW": 3}
     rows = sorted(conn_history.values(),
                   key=lambda x: (risk_order.get(x["risk"], 9), x["app"]))
 
@@ -4996,6 +5395,7 @@ def export_text(conn_history, path, console, args=None, flow=None,
 
     risk_count = Counter(c["risk"] for c in rows)
     lines.append("Risk distribution:")
+    lines.append(f"  CRIT  {risk_count.get('CRITICAL', 0):>5}")
     lines.append(f"  HIGH  {risk_count.get('HIGH', 0):>5}")
     lines.append(f"  MED   {risk_count.get('MED', 0):>5}")
     lines.append(f"  LOW   {risk_count.get('LOW', 0):>5}")
@@ -5147,6 +5547,13 @@ def export_ndjson(conn_history, path, console):
         console.print(f"[bold red]NDJSON export failed:[/bold red] {e}")
 
 
+def _csv_safe(v):
+    """Prevent CSV formula injection: a cell beginning with = + - @ tab or CR is
+    executed as a formula by Excel / LibreOffice. Prefix a single quote."""
+    s = "" if v is None else str(v)
+    return ("'" + s) if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
 def export_csv(conn_history, path, console):
     if not conn_history:
         return
@@ -5171,6 +5578,8 @@ def export_csv(conn_history, path, console):
                           "ppid", "parent_app"):
                     if row.get(k) is None:
                         row[k] = ""
+                # v1.4 (S2): neutralize CSV formula injection on every cell.
+                row = {k: _csv_safe(v) for k, v in row.items()}
                 writer.writerow(row)
         console.print(f"[bold green]CSV exported:[/bold green] {path}")
     except (OSError, csv.Error) as e:
@@ -5192,9 +5601,9 @@ def display_terminal(conn_history, console, flow=None):
     table.add_column("Geo / Org", style="green", overflow="ellipsis", max_width=30)
     table.add_column("Flags", style="red", overflow="ellipsis", max_width=36)
 
-    risk_order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MED": 2, "LOW": 3}
     for c in sorted(conn_history.values(), key=lambda x: (risk_order.get(x["risk"], 9), x["app"])):
-        risk_color = {"HIGH": "red", "MED": "yellow", "LOW": "green"}[c["risk"]]
+        risk_color = {"CRITICAL": "magenta", "HIGH": "red", "MED": "yellow", "LOW": "green"}.get(c["risk"], "magenta")
         sig = c.get("signature") or {}
         if sig.get("trusted"):
             sig_str = "[green]trusted[/green]"
@@ -5362,6 +5771,7 @@ HTML_TEMPLATE = string.Template("""<!doctype html>
   /* SELF severity pill — neutral gray, not red/orange/green. */
   .risk.noisy-self { background: var(--muted); color: var(--bg); }
   .risk { display: inline-block; padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; }
+  .risk.CRITICAL { background: #d6409f; color: #fff; }
   .risk.HIGH { background: var(--red); color: #fff; }
   .risk.MED { background: var(--orange); color: #fff; }
   .risk.LOW { background: var(--green); color: #fff; }
@@ -5514,6 +5924,7 @@ $toc_html
 <button id="back-to-top" title="Back to top" aria-label="Back to top">^</button>
 
 <div class="stats">
+  <div class="stat" data-filter="CRITICAL" title="Click to filter to CRITICAL-risk rows"><div class="label">Critical</div><div class="val" style="color: #d6409f">$crit</div></div>
   <div class="stat" data-filter="HIGH" title="Click to filter to HIGH-risk rows"><div class="label">High risk</div><div class="val" style="color: var(--red)">$high</div></div>
   <div class="stat" data-filter="MED" title="Click to filter to MED-risk rows"><div class="label">Medium risk</div><div class="val" style="color: var(--orange)">$med</div></div>
   <div class="stat" data-filter="LOW" title="Click to filter to LOW-risk rows"><div class="label">Low risk</div><div class="val" style="color: var(--green)">$low</div></div>
@@ -5531,6 +5942,7 @@ $toc_html
   <input type="search" id="filter" placeholder="Search process, IP, hostname, flag, hash...">
   <span class="control-group-label">Risk:</span>
   <button class="filter-btn" data-risk="all">All</button>
+  <button class="filter-btn" data-risk="CRITICAL">Critical</button>
   <button class="filter-btn" data-risk="HIGH">High</button>
   <button class="filter-btn" data-risk="MED">Medium</button>
   <button class="filter-btn" data-risk="LOW">Low</button>
@@ -5591,6 +6003,7 @@ $persistence_section
 $dns_section
 $capture_section
 $packet_log_section
+$coverage_section
 
 <details>
 <summary>Methodology &amp; signals</summary>
@@ -5657,7 +6070,7 @@ $packet_log_section
   let selectedProcessPorts = new Set();
 
   function isRiskFilter(key) {
-    return key === 'HIGH' || key === 'MED' || key === 'LOW';
+    return key === 'CRITICAL' || key === 'HIGH' || key === 'MED' || key === 'LOW';
   }
 
   // When user clicks risk / category, reset status to 'all'. Otherwise
@@ -5724,7 +6137,12 @@ $packet_log_section
     let visibleCount = 0;
     rows.forEach(r => {
       const numCell = r.cells[0];
-      if (r.style.display === 'none') {
+      // v1.4: count ACTUAL rendered visibility. Rows hidden by a CSS class
+      // (noisy / netmon-self) have empty inline style, so the old
+      // r.style.display check mis-counted them as visible — "Showing X of Y"
+      // and the row numbers were wrong by default. getComputedStyle sees class
+      // rules too, so the count is now correct.
+      if (window.getComputedStyle(r).display === 'none') {
         if (numCell) numCell.textContent = '';
       } else {
         visibleCount += 1;
@@ -6381,12 +6799,57 @@ def _fmt_bytes_compact(n):
     return f"{n:.1f} GB"
 
 
+def _render_coverage_section(args):
+    """v1.4: a 'Coverage & limitations' panel so a clean run is never mistaken
+    for a clean host. States which detections were armed vs dormant and what is
+    out of scope (pair with EDR/AV/FIM)."""
+    def _row(label, on, detail=""):
+        mark = ("<span style='color:var(--green)'>&#10003; armed</span>" if on
+                else "<span class='muted'>&mdash; not armed</span>")
+        d = f"<span class='muted'>{html_mod.escape(detail)}</span>" if detail else ""
+        return f"<tr><td>{html_mod.escape(label)}</td><td>{mark}</td><td>{d}</td></tr>"
+    offline = bool(getattr(args, "offline", False))
+    has_vt = bool(getattr(args, "vt_api_key", None))
+    rows = [
+        _row("Process/socket mapping + risk scoring", True),
+        _row("Code-signing / package trust", not getattr(args, "no_signing", False)),
+        _row("Packet capture (DNS/TLS-SNI/JA3/HTTP)", bool(getattr(args, "capture", None))),
+        _row("GeoIP enrichment (ipwho.is)", not offline),
+        _row("Threat-intel C2 feed (abuse.ch)", bool(getattr(args, "threat_intel", False)) and not offline),
+        _row("Tor-exit detection", bool(getattr(args, "scan_tor", False)) and not offline),
+        _row("VirusTotal hash lookups", has_vt and not offline,
+             "" if has_vt else "no $VT_API_KEY (hash links still work)"),
+        _row("Persistence enumeration", bool(getattr(args, "persistence", False) or getattr(args, "hash_tasks", False))),
+        _row("Host event-log review", bool(getattr(args, "logs", None)),
+             f"last {args.logs} min" if getattr(args, "logs", None) else ""),
+        _row("Web-shell webroot scan", bool(getattr(args, "scan_webroots", False))),
+    ]
+    win = (f"Observation window: {getattr(args, 'time', '?')}s "
+           "(beacon detection needs ~4+ intervals; use -t 240 for slow beacons).")
+    return f"""
+<section id="section-coverage">
+<details>
+<summary>Coverage &amp; limitations<span class="count-badge">scope</span></summary>
+<p class="muted">{html_mod.escape(win)}</p>
+<table><thead><tr><th>Capability</th><th>Status</th><th></th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+<div class="empty-state" style="margin-top:12px">
+<strong>Not covered (by design):</strong> memory / process-injection forensics, kernel rootkits,
+on-access AV signature scanning, file-integrity monitoring, initial-access / email security, disk
+forensics. netmon is a network + host-triage lens &mdash; <strong>pair it with EDR/Sysmon, AV, and a
+FIM</strong>. A clean netmon run does not by itself mean a clean host.
+</div>
+</details>
+</section>
+"""
+
+
 def render_html(conn_history, args, flow, output_path, console,
                 dns_findings=None, saved_pcap_path=None,
                 log_findings=None, persistence_findings=None,
                 webshell_findings=None, log_sources_skipped=None):
     rows_html = []
-    risk_order = {"HIGH": 0, "MED": 1, "LOW": 2}
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MED": 2, "LOW": 3}
     sorted_conns = sorted(conn_history.values(), key=lambda x: (risk_order.get(x["risk"], 9), x["app"]))
 
     # v1.3 UX: build a per-local-port packet-statistics index from the saved
@@ -6409,6 +6872,7 @@ def render_html(conn_history, args, flow, output_path, console,
                 count, total = port_pkt_stats.get(port, (0, 0))
                 port_pkt_stats[port] = (count + 1, total + int(p.get("size", 0) or 0))
     has_packet_data = bool(port_pkt_stats)
+    crit = sum(1 for c in sorted_conns if c["risk"] == "CRITICAL")
     high = sum(1 for c in sorted_conns if c["risk"] == "HIGH")
     med = sum(1 for c in sorted_conns if c["risk"] == "MED")
     low = sum(1 for c in sorted_conns if c["risk"] == "LOW")
@@ -6903,7 +7367,7 @@ def render_html(conn_history, args, flow, output_path, console,
             badge = '<span class="badge">0</span>'
         return f'<a href="{href}" class="{cls}">{label}{badge}</a>'
 
-    high_count_total = sum(1 for c in conn_history.values() if c["risk"] == "HIGH")
+    high_count_total = sum(1 for c in conn_history.values() if c["risk"] in ("HIGH", "CRITICAL"))
     toc_links = [
         _toc_link("#section-connections", "Connections ",
                   len(conn_history), high_count_total > 0),
@@ -6940,7 +7404,7 @@ def render_html(conn_history, args, flow, output_path, console,
         generated=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         duration=args.time,
         conn_count=len(conn_history),
-        high=high, med=med, low=low,
+        crit=crit, high=high, med=med, low=low,
         procs=procs, peers=peers, unsigned=unsigned, tor=tor, vt_mal=vt_mal,
         exposed_any=exposed_any, exposed_lan=exposed_lan,
         rows="\n".join(rows_html),
@@ -6948,6 +7412,7 @@ def render_html(conn_history, args, flow, output_path, console,
         capture_section=capture_section,
         dns_section=dns_section,
         packet_log_section=packet_log_section,
+        coverage_section=_render_coverage_section(args),
         log_section=log_section,
         persistence_section=persistence_section,
         webshell_section=webshell_section,
@@ -7068,15 +7533,31 @@ def _build_arg_parser():
     parser.add_argument("--no-firewall", action="store_true",
                         help="Skip the firewall-state snapshot (ufw / nft / iptables / "
                              "Windows Firewall profile).")
-    parser.add_argument("--full-triage", "--tr", action="store_true",
-                        help="Convenience: enable a complete one-shot triage in a single "
-                             "flag. Equivalent to: -t 30 --capture --yes --persistence "
-                             "--hash-tasks --scan-webroots --logs 3. Any explicit flag "
-                             "you also pass overrides its full-triage default (e.g. "
-                             "'--full-triage -t 60 --logs 10' runs for 60s with 10-min "
-                             "log review). Does NOT auto-enable Tor scanning or JSON "
-                             "output — pass --scan-tor / --json explicitly if wanted. "
-                             "VirusTotal still honors $VT_API_KEY env var if set.")
+    parser.add_argument("--quick-triage", "--tr", "--full-triage",
+                        action="store_true", dest="quick_triage",
+                        help="QUICK one-shot triage — safe for a possibly-compromised or "
+                             "privacy-sensitive host. Enables: -t 60 --capture --yes "
+                             "--persistence --hash-tasks --scan-webroots --logs 3 "
+                             "--threat-intel, plus a live progress display. Uses exactly "
+                             "ONE trusted intel host (the abuse.ch Feodo C2 feed) and "
+                             "GeoIP; makes NO Tor-exit fetch and NO VirusTotal API calls "
+                             "(SHA-256s still render as click-through VirusTotal links — "
+                             "no account needed). Add --offline for zero external calls. "
+                             "('--full-triage' is a kept-for-compat alias.) Any explicit "
+                             "flag you also pass wins.")
+    parser.add_argument("--deep-triage", "--dtr",
+                        action="store_true", dest="deep_triage",
+                        help="DEEP triage = everything --quick-triage does PLUS a longer "
+                             "window (-t 120) and all external intelligence: Tor-exit "
+                             "detection (--scan-tor), the abuse.ch Feodo botnet-C2 IP feed "
+                             "(--threat-intel), and VirusTotal lookups when $VT_API_KEY is "
+                             "set. Use on a TRUSTED analysis host where outbound lookups "
+                             "are acceptable. Any explicit flag you also pass wins.")
+    parser.add_argument("--threat-intel", action="store_true", dest="threat_intel",
+                        help="Fetch and use a free, open, no-auth botnet-C2 IP blocklist "
+                             "(abuse.ch Feodo Tracker — a single trusted host) to flag "
+                             "connections to known C2 (C2_FEED_MATCH, HIGH). OFF by "
+                             "default; auto-enabled by --deep-triage. Honors --offline.")
     # === v1.3 host-context features ===
     parser.add_argument("--logs", type=int, default=None, metavar="MINUTES",
                         help="Review host event logs for the last N minutes (1-1440). "
@@ -7133,52 +7614,77 @@ def _build_arg_parser():
     return parser
 
 
-def _apply_full_triage_defaults(args, console):
-    """Apply --full-triage / --tr implied defaults onto args.
+def _apply_triage_defaults(args, console):
+    """Apply --quick-triage / --deep-triage implied defaults onto args.
 
     Only fills fields that are STILL at their argparse default — so explicit
-    flags the operator also passed (e.g. -t 60, --logs 10) win over the
-    triage preset. Returns the (possibly mutated) args.
+    flags the operator also passed (e.g. -t 240, --logs 10) win over the preset.
+    Returns the (possibly mutated) args.
 
-    Set:  -t 30, --capture, --yes, --persistence, --hash-tasks,
-          --scan-webroots, --logs 3
-    Not set:  --scan-tor, --json, --ndjson, --alert-webhook
+    QUICK (default; safe for a possibly-compromised host) — a complete LOCAL
+    sweep that makes no chatty/identifying outbound calls:
+        -t 60, --capture, --yes, --persistence, --hash-tasks, --scan-webroots,
+        --logs 3.  No Tor fetch, no external threat-intel, no VirusTotal API.
+
+    DEEP — everything QUICK does, a longer window, plus opt-in external
+    intelligence on a trusted host:
+        -t 120, --scan-tor, --threat-intel (+ VirusTotal if $VT_API_KEY set).
     """
-    if not getattr(args, "full_triage", False):
+    quick = getattr(args, "quick_triage", False)
+    deep = getattr(args, "deep_triage", False)
+    if not quick and not deep:
         return args
+    mode = "deep" if deep else "quick"
     activated = []
-    # -t 30 only if user didn't pass an explicit duration. argparse default
-    # for --time is 15, so we treat 15 as "still default".
-    if args.time == 15:
-        args.time = 30
-        activated.append("-t 30")
-    # --capture (and --yes) — only if no capture flag was already set.
+    # Longer default window than a bare run (the old preset's 30 s was too short
+    # for beacon detection, which needs >= 4 timed attempts). Deep waits longer.
+    default_time = 120 if deep else 60
+    if args.time == 15:  # 15 == argparse default == "still default"
+        args.time = default_time
+        activated.append(f"-t {default_time}")
+    # Local capture (+ auto-confirm), persistence, hash-tasks, webroots, logs.
     if args.capture is None and not getattr(args, "capture_fly", False) \
             and getattr(args, "save_capture", None) is None:
         args.capture = "__AUTO__"
         activated.append("--capture --yes")
     args.yes = True
-    # --persistence
     if not args.persistence:
         args.persistence = True
         activated.append("--persistence")
-    # --hash-tasks
     if not args.hash_tasks:
         args.hash_tasks = True
         activated.append("--hash-tasks")
-    # --scan-webroots
     if not args.scan_webroots:
         args.scan_webroots = True
         activated.append("--scan-webroots")
-    # --logs 3 — only if user didn't pass --logs N explicitly.
     if args.logs is None:
         args.logs = 3
         activated.append("--logs 3")
-    # Console heads-up so the operator sees what was implied.
-    console.print(
-        "[bold cyan]--full-triage active.[/bold cyan] "
-        "Activated: " + ", ".join(activated)
-    )
+    # Threat-intel C2 feed (abuse.ch Feodo) — a SINGLE trusted host, so it is
+    # acceptable even in QUICK mode (the common case). Honors --offline.
+    if not getattr(args, "threat_intel", False):
+        args.threat_intel = True
+        activated.append("--threat-intel")
+    # DEEP-only: Tor-exit detection (torproject.org is widely SNI-filtered and
+    # sensitive to reach from a monitored host) plus VirusTotal lookups. QUICK
+    # stays Tor-free and makes no VirusTotal API calls.
+    if deep and not getattr(args, "scan_tor", False):
+        args.scan_tor = True
+        activated.append("--scan-tor")
+    console.print(f"[bold cyan]--{mode}-triage active.[/bold cyan] "
+                  "Activated: " + ", ".join(activated))
+    # Tell the operator what IS and is NOT armed, so a clean run is never
+    # mistaken for "nothing to find" (the most dangerous failure for a triage
+    # tool). See also the report's coverage notes.
+    geo = "GeoIP via ipwho.is" + (" (disabled: --offline)" if args.offline else "")
+    if deep:
+        vt_state = "ON ($VT_API_KEY set)" if args.vt_api_key else "no API key (link-level only)"
+        console.print(f"[dim]External intel ARMED: abuse.ch C2 feed, Tor exits, "
+                      f"VirusTotal {vt_state}. {geo}.[/dim]")
+    else:
+        console.print(f"[dim]Armed: abuse.ch C2 feed (one trusted host), {geo}. "
+                      "NOT armed: Tor fetch, VirusTotal API calls (SHA-256s still link "
+                      "to VirusTotal). Run --deep-triage on a trusted host for Tor + VT.[/dim]")
     return args
 
 
@@ -7339,7 +7845,7 @@ def _validate_args(args, console):
                     console.print(f"[bold red]error:[/bold red] --{path_attr.replace('_', '-')} "
                                   f"parent directory does not exist: {parent}")
                     return EXIT_USAGE
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 console.print(f"[bold red]error:[/bold red] invalid --{path_attr.replace('_', '-')} "
                               f"path: {e}")
                 return EXIT_USAGE
@@ -7380,10 +7886,11 @@ def main(argv=None):
     if getattr(args, "diff", None):
         return _run_diff_mode(args, console)
 
-    # v1.3 convenience: --full-triage / --tr expands into the canonical
-    # multi-flag triage set. Applied BEFORE _resolve_default_paths so the
-    # auto-path machinery resolves capture/log/etc. paths properly.
-    args = _apply_full_triage_defaults(args, console)
+    # Convenience presets: --quick-triage / --tr (safe, local-only) and
+    # --deep-triage / --dtr (adds Tor + abuse.ch C2 feed + VT). Applied BEFORE
+    # _resolve_default_paths so the auto-path machinery resolves capture/log/etc.
+    # paths properly.
+    args = _apply_triage_defaults(args, console)
 
     # Resolve auto paths (--output / --html / --save-capture / --json) into
     # timestamped filenames inside ./reports/ so reruns don't overwrite each
@@ -7502,6 +8009,13 @@ def _run_diff_mode(args, console):
 
 def render_diff_html(result, old, new, out_path, console):
     """Minimal self-contained diff HTML — reuses the main theme's CSS variables."""
+    def _risk_span(v):
+        # v1.4 (S1): risk/from/to come from an UNVALIDATED --diff JSON file.
+        # Whitelist the CSS class and escape the text, or a planted report file
+        # yields stored XSS when the analyst opens the diff HTML.
+        v = v if v in ("CRITICAL", "HIGH", "MED", "LOW", "INFO") else "LOW"
+        return f"<span class='risk {v}'>{html_mod.escape(v)}</span>"
+
     def _rows(items, kind):
         out = []
         for r in items[:500]:
@@ -7512,8 +8026,7 @@ def render_diff_html(result, old, new, out_path, console):
                     f"<td>{row.get('pid') or ''}</td>"
                     f"<td>{html_mod.escape(row.get('local') or '')}</td>"
                     f"<td>{html_mod.escape(row.get('remote') or '')}</td>"
-                    f"<td><span class='risk {r['from']}'>{r['from']}</span> → "
-                    f"<span class='risk {r['to']}'>{r['to']}</span></td>"
+                    f"<td>{_risk_span(r['from'])} → {_risk_span(r['to'])}</td>"
                     f"<td>{html_mod.escape(', '.join(row.get('flags') or []))}</td></tr>"
                 )
             else:
@@ -7522,7 +8035,7 @@ def render_diff_html(result, old, new, out_path, console):
                     f"<td>{r.get('pid') or ''}</td>"
                     f"<td>{html_mod.escape(r.get('local') or '')}</td>"
                     f"<td>{html_mod.escape(r.get('remote') or '')}</td>"
-                    f"<td><span class='risk {r.get('risk','LOW')}'>{r.get('risk','LOW')}</span></td>"
+                    f"<td>{_risk_span(r.get('risk','LOW'))}</td>"
                     f"<td>{html_mod.escape(', '.join(r.get('flags') or []))}</td></tr>"
                 )
         return "".join(out)
@@ -7550,6 +8063,7 @@ table {{ width:100%; border-collapse:collapse; background:var(--panel);
 th, td {{ padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); }}
 th {{ background:#1c2128; color:var(--muted); font-size:12px; }}
 .risk {{ padding:2px 8px; border-radius:4px; font-weight:600; font-size:11px; color:#fff; }}
+.risk.CRITICAL {{ background:#d6409f; }}
 .risk.HIGH {{ background:var(--red); }}
 .risk.MED  {{ background:var(--orange); }}
 .risk.LOW  {{ background:var(--green); }}
