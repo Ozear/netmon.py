@@ -52,7 +52,7 @@ except ImportError:
     HAS_IPWHOIS = False
 
 
-VERSION = "1.4.0-dev"
+VERSION = "1.4.0"
 
 log = logging.getLogger("netmon")
 
