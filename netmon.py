@@ -3889,7 +3889,7 @@ def compute_diff(old, new):
 
 def send_webhook_alerts(webhook_url, conn_history, log_findings=None,
                        persistence=None, webshell=None, console=None):
-    """POST a JSON payload of HIGH findings to a webhook. Caller passes URL.
+    """POST a JSON payload of HIGH/CRITICAL findings to a webhook. Caller passes URL.
     Errors are logged but never raised — alerting failure must not break
     the report run.
 
@@ -3906,23 +3906,27 @@ def send_webhook_alerts(webhook_url, conn_history, log_findings=None,
     """
     if not webhook_url:
         return
-    high_rows = [c for c in conn_history.values()
-                 if c.get("risk") == "HIGH"]
+    # v1.4: include CRITICAL (the tier above HIGH) — a CRITICAL finding is the
+    # worst kind and must trigger the alert, not be filtered out.
+    alert_rows = [c for c in conn_history.values()
+                  if c.get("risk") in ("CRITICAL", "HIGH")]
     high_logs = [e for e in (log_findings or [])
                  if e.get("severity") == "HIGH"]
     high_persist = [p for p in (persistence or [])
                     if p.get("recent")]
-    if not (high_rows or high_logs or high_persist or webshell):
+    if not (alert_rows or high_logs or high_persist or webshell):
         return
+    crit_n = sum(1 for c in alert_rows if c.get("risk") == "CRITICAL")
     payload = {
         "tool":    f"netmon.py/{VERSION}",
         "host":    socket.gethostname(),
         "ts":      datetime.now().isoformat(),
-        "high_conn_count": len(high_rows),
+        "critical_conn_count": crit_n,
+        "high_conn_count": len(alert_rows) - crit_n,
         "high_log_count":  len(high_logs),
         "recent_persistence": len(high_persist),
         "webshell_findings": len(webshell or []),
-        "summary": _summarize_for_webhook(high_rows, high_logs, webshell or []),
+        "summary": _summarize_for_webhook(alert_rows, high_logs, webshell or []),
     }
     try:
         requests.post(webhook_url, json=payload, timeout=HTTP_TIMEOUT)
@@ -3938,7 +3942,7 @@ def _summarize_for_webhook(rows, logs, webshell):
     """Build a small human-readable summary for the webhook body."""
     lines = []
     for c in rows[:20]:
-        lines.append(f"  HIGH conn: {c.get('app')} {c.get('local')} → "
+        lines.append(f"  {c.get('risk', 'HIGH')} conn: {c.get('app')} {c.get('local')} → "
                      f"{c.get('remote')} [{', '.join(c.get('flags') or [])}]")
     for e in logs[:20]:
         lines.append(f"  HIGH log:  {e.get('source')} {e.get('event_id')} — {e.get('message','')[:120]}")

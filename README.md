@@ -307,10 +307,13 @@ Concise list to hand to a vendor / IR team / auditor:
   (macOS). Every one is `check=False`, `capture_output=True`, with bounded
   timeouts and validated input.
 - **No outbound network calls except** (a) `ipwho.is` (HTTPS GeoIP, no key),
-  (b) `virustotal.com` (only when `--vt-api-key` is given), (c) the Tor
-  exit-list (only when `--scan-tor` is given), and (d) the local CrowdSec LAPI
-  on `127.0.0.1:8080` if running. Every documented endpoint is listed in
-  `--help` and disabled by `--offline`.
+  (b) the abuse.ch **Feodo Tracker** botnet-C2 IP feed (`feodotracker.abuse.ch`,
+  no key — only with `--threat-intel` / `--quick-triage` / `--deep-triage`),
+  (c) `virustotal.com` (only with `--vt-api-key`), (d) the Tor exit-list (only
+  with `--scan-tor`), and (e) the local CrowdSec LAPI on `127.0.0.1:8080` if
+  running. All of these are disabled by `--offline`. The optional, off-by-default
+  `--alert-webhook` (`$NETMON_WEBHOOK`, hidden from `--help`) additionally POSTs a
+  HIGH/CRITICAL findings summary to a URL **you** supply.
 - **No file writes** other than to user-specified `./reports/` output paths
   (HTML / TXT / CSV / JSON / NDJSON / PCAP). No registry writes, no
   scheduled-task creation, no service install, no startup-folder drops,
